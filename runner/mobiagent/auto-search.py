@@ -383,6 +383,17 @@ def persist_outputs(
         normalized.pop("source_task", None)
         normalized_actions.append(normalized)
 
+    from datetime import datetime
+    
+    # 获取当前日期、星期和时间
+    now = datetime.now()
+    weekdays = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日']
+    execution_timestamp = {
+        "date": now.strftime("%Y-%m-%d"),
+        "weekday": weekdays[now.weekday()],
+        "time": now.strftime("%H:%M:%S")
+    }
+    
     normalized_reacts: List[Dict[str, Any]] = []
     for idx, item in enumerate(reacts, 1):
         normalized = dict(item)
@@ -395,6 +406,7 @@ def persist_outputs(
         "task_type": "auto_search",
         "old_task_description": None,
         "task_description": computed_task_description,
+        "execution_timestamp": execution_timestamp,
         "action_count": len(normalized_actions),
         "actions": normalized_actions,
     }
@@ -2602,8 +2614,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="Android", choices=["Android", "Harmony"], help="设备类型")
     parser.add_argument("--service_ip", type=str, default="localhost", help="Decider 服务IP")
     parser.add_argument("--decider_port", type=int, default=8000, help="Decider 服务端口")
+    
+    parser.add_argument("--decider_api_key", type=str, default=os.getenv("DECIDER_API_KEY", "mobiagent-key"), help="Decider API Key")
+
     parser.add_argument("--decider_base_url", type=str, default="", help="Decider Base URL（优先于 service_ip+port）")
-    parser.add_argument("--decider_api_key", type=str, default="", help="Decider API Key")
     parser.add_argument("--decider_model", type=str, default="", help="Decider 模型名（为空时使用占位符）")
 
     parser.add_argument("--openrouter_base_url", type=str, default="https://openrouter.ai/api/v1", help="Explorer 的 Base URL")
