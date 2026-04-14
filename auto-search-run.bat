@@ -7,22 +7,26 @@ setlocal enabledelayedexpansion
 :: 使用方式：直接双击运行，或在 CMD/PowerShell 中执行此文件
 :: ==========================================================
 
-:: 基础参数配置
+:: 基础参数配置（Decider 使用 DECIDER_BASE_URL）
 set APP_NAME=美团
 set DEPTH=2
 set BREADTH=10
 set DEVICE=Android
-set SERVICE_IP=166.111.53.96
-set DECIDER_PORT=7003
-set SJTU_BASE_URL=https://models.sjtu.edu.cn/api/v1
-set SJTU_API_KEY=sk-7PSBcDuOjYh9VPOK05-e_w
-set SJTU_MODEL=qwen3vl
-set EXPLORER_MODEL=%SJTU_MODEL%
-set OPENROUTER_BASE_URL=%SJTU_BASE_URL%
+set DECIDER_BASE_URL=http://166.111.53.96:7003
+set DECIDER_MODEL=MobiMind-1.5-4B
+:: Decider API Key：通过环境变量 DECIDER_API_KEY 传入，默认为 mobiagent-key
+if not defined DECIDER_API_KEY set DECIDER_API_KEY=mobiagent-key
+
+:: Explorer 相关参数（使用 SJTU 服务）
+set EXPLORER_MODEL=qwen3vl
+set OPENROUTER_BASE_URL=https://models.sjtu.edu.cn/api/v1
+:: Explorer API Key：通过环境变量 SJTU_API_KEY 传入（必需）
+if not defined SJTU_API_KEY (
+    echo Error: Please set SJTU_API_KEY environment variable first
+    pause
+    exit /b 1
+)
 set OPENROUTER_API_KEY=%SJTU_API_KEY%
-set DECIDER_BASE_URL=%SJTU_BASE_URL%
-set DECIDER_API_KEY=%SJTU_API_KEY%
-set DECIDER_MODEL=%SJTU_MODEL%
 
 :: 运行模式配置
 set USE_QWEN3=on
@@ -66,8 +70,6 @@ set CMD=python -m runner.mobiagent.auto-search ^
  --depth "%DEPTH%" ^
  --breadth "%BREADTH%" ^
  --device "%DEVICE%" ^
- --service_ip "%SERVICE_IP%" ^
- --decider_port "%DECIDER_PORT%" ^
  --decider_base_url "%DECIDER_BASE_URL%" ^
  --decider_api_key "%DECIDER_API_KEY%" ^
  --decider_model "%DECIDER_MODEL%" ^
