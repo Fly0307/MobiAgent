@@ -70,6 +70,8 @@ DECIDER_MODEL_PLACEHOLDER = ""
 
 # 后台 I/O 线程池：图像标注、hierarchy 写盘、JSON 持久化均 fire-and-forget，不阻塞 DFS 主线程
 _ANNOTATION_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+# 指纹计算线程池：常驻复用，避免 _compute_fingerprints_concurrent 每次调用创建新池
+_FP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 
 
 class WaitActionSkip(Exception):
@@ -124,67 +126,6 @@ def _cv2_imwrite_unicode(path: str, img) -> bool:
     except Exception:
         pass
     return False
-
-def _wait_for_page_loaded(
-    decider_client: "OpenAI",
-    decider_model: str,
-    device,
-    device_type: str,
-) -> None:
-    """动作执行后等待页面加载完成：先固定等待，再让 VLM 判断截图是否仍处于加载状态。
-    如果 VLM 判断还在加载，则等待 PAGE_LOAD_STABLE_POLL_INTERVAL 后重试，
-    最多重试 PAGE_LOAD_STABLE_MAX_POLLS 次。
-    """
-    time.sleep(PAGE_LOAD_WAIT_SEC)
-
-    for poll in range(PAGE_LOAD_STABLE_MAX_POLLS):
-        screenshot_b64 = get_screenshot(device, device_type)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "Look at this mobile app screenshot. "
-                            "Is the page still loading? "
-                            "Signs of loading include: spinning indicators, skeleton screens, "
-                            "blank/white content areas, progress bars, "
-                            "or text like '加载中' / '正在加载' / 'Loading'. "
-                            "Reply with exactly one word: YES or NO."
-                        ),
-                    },
-                ],
-            }
-        ]
-        try:
-            resp = decider_client.chat.completions.create(
-                model=decider_model,
-                messages=messages,
-                max_tokens=8,
-                timeout=15,
-            )
-            answer = (resp.choices[0].message.content or "").strip().upper()
-            still_loading = answer.startswith("YES")
-        except Exception as e:
-            logging.warning("Page-load VLM check failed (poll=%d): %s", poll + 1, e)
-            still_loading = False  # 模型调用失败时不阻塞，直接继续
-
-        if not still_loading:
-            if poll > 0:
-                logging.info("Page loaded after %d extra poll(s).", poll)
-            break
-
-        logging.info(
-            "Page still loading (poll=%d/%d), waiting %.1fs...",
-            poll + 1, PAGE_LOAD_STABLE_MAX_POLLS, PAGE_LOAD_STABLE_POLL_INTERVAL,
-        )
-        time.sleep(PAGE_LOAD_STABLE_POLL_INTERVAL)
-
 
 #加载中文字体
 def _load_font(size: int = 36) -> ImageFont.FreeTypeFont:
@@ -1074,14 +1015,30 @@ def _compute_fingerprints_concurrent(
     screenshot_path: Optional[str] = None,
 ) -> tuple:
     """并发计算 (fp, struct_fp, dhash_hex)，任一失败则对应返回 ''。"""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        fut_fp     = pool.submit(_hierarchy_fingerprint, hierarchy_text)
-        fut_struct = pool.submit(_compute_hierarchy_struct_fingerprint, hierarchy_text)
-        fut_dhash  = pool.submit(_compute_dhash_hex, screenshot_path) if screenshot_path else None
-        fp        = _safe_future(fut_fp, "")
-        struct_fp = _safe_future(fut_struct, "")
-        dhash_hex = _safe_future(fut_dhash, "") if fut_dhash else ""
+    fut_fp     = _FP_EXECUTOR.submit(_hierarchy_fingerprint, hierarchy_text)
+    fut_struct = _FP_EXECUTOR.submit(_compute_hierarchy_struct_fingerprint, hierarchy_text)
+    fut_dhash  = _FP_EXECUTOR.submit(_compute_dhash_hex, screenshot_path) if screenshot_path else None
+    fp        = _safe_future(fut_fp, "")
+    struct_fp = _safe_future(fut_struct, "")
+    dhash_hex = _safe_future(fut_dhash, "") if fut_dhash else ""
     return fp, struct_fp, dhash_hex
+
+
+def _triple_verify(
+    pre_hierarchy: str,
+    pre_struct_fp: str,
+    pre_dhash: str,
+    post_hierarchy: str,
+    post_screenshot_path: str,
+) -> bool:
+    """三重验证：稳定文本指纹 + 结构指纹 + 视觉dHash，2/3通过则认为回溯成功。"""
+    fp_ok = _stable_text_fingerprint(pre_hierarchy) == _stable_text_fingerprint(post_hierarchy)
+    _, post_struct_fp_val, post_dhash = _compute_fingerprints_concurrent(
+        post_hierarchy, screenshot_path=post_screenshot_path
+    )
+    struct_ok = pre_struct_fp == post_struct_fp_val
+    visual_ok = (_hamming_distance_hex(pre_dhash, post_dhash) <= 3) if pre_dhash and post_dhash else fp_ok
+    return (int(fp_ok) + int(struct_ok) + int(visual_ok)) >= 2
 
 
 def _save_collect_snapshot(
@@ -1751,6 +1708,15 @@ class ScreenStateCache:
         self._last_capture = 0.0
 
 
+def _capture_screen(
+    device, device_type: str, screen_cache: Optional["ScreenStateCache"]
+) -> tuple:
+    """统一屏幕采集：有缓存则 force 刷新缓存，否则直接调用设备接口。"""
+    if screen_cache is not None:
+        return screen_cache.capture(device, device_type, force=True)
+    return get_screenshot(device, device_type), get_hierarchy_text(device)
+
+
 def call_explorer_model(
     explorer_client: OpenAI,
     explorer_model: str,
@@ -2106,20 +2072,20 @@ def explore_dfs(
     if current_depth >= depth_limit:
         return
 
-    # OPT-10: 用 ScreenStateCache 合并采集，避免重复设备调用
-    if screen_cache is not None:
-        screenshot_b64, hierarchy_text = screen_cache.capture(device, device_type, force=True)
-    else:
-        screenshot_b64 = get_screenshot(device, device_type)
-        hierarchy_text = get_hierarchy_text(device)
+    # OPT-10: 用 _capture_screen 合并采集，避免重复设备调用
+    screenshot_b64, hierarchy_text = _capture_screen(device, device_type, screen_cache)
 
-    if (
+    # 预计算：整个 DFS 调用期间这5个参数不变，避免三处重复判断
+    _do_collect = (
         enable_ui_semantic_collect
         and collect_queue is not None
         and queue_lock is not None
         and index_lock is not None
-        and index_path
-    ):
+        and bool(index_path)
+    )
+
+    if _do_collect:
+        assert collect_queue is not None and queue_lock is not None and index_lock is not None and index_path
         enqueue_ui_collect_if_new(
             app_name=app_name,
             device_type=device_type,
@@ -2144,11 +2110,7 @@ def explore_dfs(
         y = (dismiss_bounds[1] + dismiss_bounds[3]) // 2
         device.click(x, y)
         time.sleep(DEVICE_WAIT_TIME)
-        if screen_cache is not None:
-            screenshot_b64, hierarchy_text = screen_cache.capture(device, device_type, force=True)
-        else:
-            screenshot_b64 = get_screenshot(device, device_type)
-            hierarchy_text = get_hierarchy_text(device)
+        screenshot_b64, hierarchy_text = _capture_screen(device, device_type, screen_cache)
         logging.info(
             "\033[93m[RuleDismiss] clicked (%d,%d) attempt %d\033[0m",
             x, y, _rule_attempt + 1,
@@ -2231,11 +2193,7 @@ def explore_dfs(
                 )
         time.sleep(DEVICE_WAIT_TIME)
         # 刷新状态并重新让 Explorer 判断是否还有弹窗
-        if screen_cache is not None:
-            screenshot_b64, hierarchy_text = screen_cache.capture(device, device_type, force=True)
-        else:
-            screenshot_b64 = get_screenshot(device, device_type)
-            hierarchy_text = get_hierarchy_text(device)
+        screenshot_b64, hierarchy_text = _capture_screen(device, device_type, screen_cache)
         candidates, popup_info = call_explorer_model(
             explorer_client,
             explorer_model,
@@ -2282,13 +2240,8 @@ def explore_dfs(
                 )
                 screenshot_b64 = get_screenshot(device, device_type)
                 base_hierarchy_text = current_hierarchy_text
-                if (
-                    enable_ui_semantic_collect
-                    and collect_queue is not None
-                    and queue_lock is not None
-                    and index_lock is not None
-                    and index_path
-                ):
+                if _do_collect:
+                    assert collect_queue is not None and queue_lock is not None and index_lock is not None and index_path
                     enqueue_ui_collect_if_new(
                         app_name=app_name,
                         device_type=device_type,
@@ -2345,16 +2298,6 @@ def explore_dfs(
             pre_hierarchy_text, screenshot_path=pre_screenshot_path
         )
         try:
-            # step_result = execute_decider_one_step(
-            #     decider_client=explorer_client,
-            #     decider_model=explorer_model,
-            #     device=device,
-            #     device_type=device_type,
-            #     step_task=task,
-            #     use_qwen3=use_qwen3,
-            #     output_dir=step_output_dir,
-            #     step_index=step_idx,
-            # )
             step_result = execute_decider_one_step(
                 decider_client=decider_client,
                 decider_model=decider_model,
@@ -2372,13 +2315,8 @@ def explore_dfs(
             react_item = step_result["react_item"]
             decider_resp = step_result["decider_response"]
             post_hierarchy_text = step_result.get("post_hierarchy_text", "")
-            if (
-                enable_ui_semantic_collect
-                and collect_queue is not None
-                and queue_lock is not None
-                and index_lock is not None
-                and index_path
-            ):
+            if _do_collect:
+                assert collect_queue is not None and queue_lock is not None and index_lock is not None and index_path
                 _ = get_screenshot(device, device_type)
                 enqueue_ui_collect_if_new(
                     app_name=app_name,
@@ -2524,19 +2462,12 @@ def explore_dfs(
             else:
                 logging.warning("\033[91mApp did not return to foreground after restart.\033[0m")
         else:
-            # 三重验证：文本指纹 + 结构指纹 + 视觉dHash，2/3通过则认为回溯成功
-            fp_ok = (_stable_text_fingerprint(pre_hierarchy_text) == _stable_text_fingerprint(post_back_hierarchy))
-            _, post_struct_fp_val, post_dhash = _compute_fingerprints_concurrent(
-                post_back_hierarchy, screenshot_path=post_back_screenshot_path
-            )
-            struct_ok = (pre_struct_fp == post_struct_fp_val)
-            visual_ok = (bin(int(pre_dhash, 16) ^ int(post_dhash, 16)).count("1") <= 3) if pre_dhash and post_dhash else fp_ok
-            verified = (int(fp_ok) + int(struct_ok) + int(visual_ok)) >= 2
+            # 三重验证：稳定文本指纹 + 结构指纹 + 视觉dHash，2/3通过则认为回溯成功
+            verified = _triple_verify(pre_hierarchy_text, pre_struct_fp, pre_dhash, post_back_hierarchy, post_back_screenshot_path)
 
         if not verified:
             logging.warning(
-                "\033[93mBacktrack verification failed (fp=%s struct=%s visual=%s). Attempting full path replay.\033[0m",
-                fp_ok, struct_ok, visual_ok,
+                "\033[93mBacktrack verification failed. Attempting full path replay.\033[0m"
             )
             # 全路径重播恢复：从App根重播当前路径的所有前置动作
             recovered = False
@@ -2562,13 +2493,7 @@ def explore_dfs(
                         logging.info("\033[92mFull path replay recovery succeeded (first step, app in foreground).\033[0m")
                         break
                     continue
-                r_fp_ok = (_stable_text_fingerprint(pre_hierarchy_text) == _stable_text_fingerprint(replay_hierarchy))
-                _, r_struct_fp_val, r_dhash = _compute_fingerprints_concurrent(
-                    replay_hierarchy, screenshot_path=post_back_screenshot_path
-                )
-                r_struct_ok = (pre_struct_fp == r_struct_fp_val)
-                r_visual_ok = (bin(int(pre_dhash, 16) ^ int(r_dhash, 16)).count("1") <= 3) if pre_dhash and r_dhash else r_fp_ok
-                if (int(r_fp_ok) + int(r_struct_ok) + int(r_visual_ok)) >= 2:
+                if _triple_verify(pre_hierarchy_text, pre_struct_fp, pre_dhash, replay_hierarchy, post_back_screenshot_path):
                     recovered = True
                     logging.info("\033[92mFull path replay recovery succeeded on attempt %d.\033[0m", attempt + 1)
                     break
