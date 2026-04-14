@@ -8,6 +8,7 @@ import queue
 import re
 import subprocess
 import sys
+import concurrent.futures
 import threading
 import time
 import textwrap
@@ -66,6 +67,14 @@ EXPLORER_MAX_TOKENS = 1024
 MAX_RETRIES = 3
 DEVICE_WAIT_TIME = 0.6
 DECIDER_MODEL_PLACEHOLDER = ""
+
+# 后台 I/O 线程池：图像标注、hierarchy 写盘、JSON 持久化均 fire-and-forget，不阻塞 DFS 主线程
+_ANNOTATION_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
+
+class WaitActionSkip(Exception):
+    """Decider 返回 wait 动作时抛出，通知 DFS 跳过本候选、不计入步骤。"""
+    pass
 
 # 页面加载等待（由 main() 从命令行参数覆写）
 # 固定等待：每次动作后固定睡眠的秒数
@@ -184,6 +193,20 @@ def _load_font(size: int = 36) -> ImageFont.FreeTypeFont:
     except Exception:
         return ImageFont.load_default()
 
+def _run_annotation_safe(
+    action: str,
+    action_record: Dict[str, Any],
+    screenshot_file: str,
+    output_dir: str,
+    step_index: int,
+) -> None:
+    """供 _ANNOTATION_EXECUTOR.submit 使用的安全包装，异常仅记录日志。"""
+    try:
+        annotate_action_visuals(action, action_record, screenshot_file, output_dir, step_index)
+    except Exception as e:
+        logging.warning(f"[async annotation] step={step_index}: {e}")
+
+
 #在每一步的截图上绘制动作相关的可视化标记，生成多个版本的标注图片，方便后续分析和调试
 def annotate_action_visuals(
     action: str,
@@ -255,28 +278,39 @@ def annotate_action_visuals(
                 _cv2_imwrite_unicode(swipe_path, cv2image)
 
 
+def _write_hierarchy_safe(
+    hierarchy: Any,
+    device_type: str,
+    data_dir: str,
+    step_index: int,
+) -> None:
+    """后台安全写入 hierarchy 文件，供 _ANNOTATION_EXECUTOR 使用。"""
+    try:
+        if device_type == "Android":
+            path = os.path.join(data_dir, f"{step_index}.xml")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(str(hierarchy))
+            return
+        path = os.path.join(data_dir, f"{step_index}.json")
+        try:
+            obj = json.loads(hierarchy) if isinstance(hierarchy, str) else hierarchy
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2)
+        except Exception:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(str(hierarchy))
+    except Exception as e:
+        logging.warning(f"[async hierarchy write] step={step_index}: {e}")
+
+
 def save_hierarchy(device, device_type: str, data_dir: str, step_index: int) -> None:
-    """保存当前界面层级结构。"""
+    """保存当前界面层级结构（设备采集同步，文件写入异步）。"""
     try:
         hierarchy = device.dump_hierarchy()
     except Exception as e:
         logging.error(f"Dump hierarchy failed: {e}")
         hierarchy = "<hierarchy_dump_failed/>" if device_type == "Android" else {}
-
-    if device_type == "Android":
-        path = os.path.join(data_dir, f"{step_index}.xml")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(str(hierarchy))
-        return
-
-    path = os.path.join(data_dir, f"{step_index}.json")
-    try:
-        obj = json.loads(hierarchy) if isinstance(hierarchy, str) else hierarchy
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2)
-    except Exception:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(str(hierarchy))
+    _ANNOTATION_EXECUTOR.submit(_write_hierarchy_safe, hierarchy, device_type, data_dir, step_index)
 
 
 def get_current_screenshot_path(device_type: str) -> str:
@@ -385,6 +419,32 @@ def persist_step_output(
         [react_item],
         task_description=action_record.get("source_task"),
     )
+
+def _persist_step_output_safe(
+    output_dir: str,
+    app_name: str,
+    action_record: Dict[str, Any],
+    react_item: Dict[str, Any],
+) -> None:
+    """供 _ANNOTATION_EXECUTOR.submit 使用的安全包装。"""
+    try:
+        persist_step_output(output_dir, app_name, action_record, react_item)
+    except Exception as e:
+        logging.warning(f"[async persist_step] {e}")
+
+
+def _persist_outputs_safe(
+    output_dir: str,
+    app_name: str,
+    actions: List[Dict[str, Any]],
+    reacts: List[Dict[str, Any]],
+) -> None:
+    """供 _ANNOTATION_EXECUTOR.submit 使用的安全包装。"""
+    try:
+        persist_outputs(output_dir, app_name, actions, reacts)
+    except Exception as e:
+        logging.warning(f"[async persist_outputs] {e}")
+
 
 # 将该路径涉及的所有步骤目录中的文件复制到指定路径，并在复制过程中根据新的顺序重命名文件，确保在 path_dir 中形成一个连续的步骤序列，方便后续分析和调试使用
 def copy_step_artifacts_to_path(steps_dir: str, path_dir: str, step_indices: List[int]) -> None:
@@ -590,6 +650,115 @@ def _is_app_in_foreground(device, device_type: str, app_name: Optional[str], hie
     if hierarchy_text:
         return package_name in hierarchy_text
     return True
+
+
+# ── 广告/弹窗关闭关键词 ──────────────────────────────────────────────────────
+_CLOSE_ID_KWS = (
+    "close", "dismiss", "skip", "cancel", "iv_close", "btn_close",
+    "tv_skip", "ad_close", "popup_close", "dialog_close",
+    "关闭", "跳过", "不再提示", "我知道了",
+)
+_AD_CONTAINER_KWS = (
+    "ad", "banner", "interstitial", "splash_ad", "popup",
+    "dialog", "modal", "overlay", "floatview", "float_view",
+)
+
+
+def _find_dismissible_element(hierarchy_text: str) -> Optional[List[int]]:
+    """在 hierarchy 中寻找广告/弹窗关闭按钮，返回 bounds [x1,y1,x2,y2]。
+    无需 LLM，纯规则匹配。优先匹配 resource-id 含关闭关键词的 clickable 元素；
+    次优匹配 text/content-desc 含关闭关键词的 clickable 元素。
+    返回 None 表示未找到。
+    """
+    if not hierarchy_text:
+        return None
+
+    def _parse_bounds(bounds_str: str) -> Optional[List[int]]:
+        if parse_bounds:
+            return parse_bounds(bounds_str)
+        m = re.findall(r"\d+", bounds_str or "")
+        return [int(x) for x in m] if len(m) == 4 else None
+
+    # ── Android XML ──────────────────────────────────────────────────────────
+    if hierarchy_text.lstrip().startswith("<"):
+        try:
+            root = ET.fromstring(hierarchy_text)
+        except Exception:
+            return None
+        best: Optional[List[int]] = None
+        for node in root.iter():
+            clickable = (node.attrib.get("clickable") or "").lower() == "true"
+            if not clickable:
+                continue
+            res_id = (node.attrib.get("resource-id") or "").lower()
+            text   = (node.attrib.get("text") or "").lower()
+            desc   = (node.attrib.get("content-desc") or "").lower()
+            combined = res_id + "|" + text + "|" + desc
+            if any(kw in combined for kw in _CLOSE_ID_KWS):
+                bounds = _parse_bounds(node.attrib.get("bounds", ""))
+                if bounds:
+                    # resource-id 命中优先级高于 text/desc
+                    if any(kw in res_id for kw in _CLOSE_ID_KWS):
+                        return bounds
+                    best = best or bounds
+        return best
+
+    # ── Harmony / JSON ───────────────────────────────────────────────────────
+    try:
+        obj = json.loads(hierarchy_text)
+    except Exception:
+        return None
+
+    result: List[Optional[List[int]]] = [None]
+
+    def _walk(node: Any) -> None:
+        if result[0] is not None:
+            return
+        if isinstance(node, dict):
+            attrs = node.get("attributes") if isinstance(node.get("attributes"), dict) else node
+            clickable = str(attrs.get("clickable", attrs.get("enabled", "false"))).lower() in {"true", "1"}
+            if clickable:
+                res_id = str(attrs.get("resource-id", attrs.get("id", ""))).lower()
+                text   = str(attrs.get("text", attrs.get("label", ""))).lower()
+                desc   = str(attrs.get("contentDescription", attrs.get("content-desc", ""))).lower()
+                combined = res_id + "|" + text + "|" + desc
+                if any(kw in combined for kw in _CLOSE_ID_KWS):
+                    raw_bounds = attrs.get("bounds") or attrs.get("rect")
+                    if isinstance(raw_bounds, (list, tuple)) and len(raw_bounds) == 4:
+                        result[0] = [int(v) for v in raw_bounds]
+                        return
+                    if isinstance(raw_bounds, str):
+                        b = _parse_bounds(raw_bounds)
+                        if b:
+                            result[0] = b
+                            return
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(obj)
+    return result[0]
+
+
+def _detect_countdown(h1: str, h2: str) -> Optional[int]:
+    """对比两次 hierarchy 文本，寻找纯数字文本在 [1,60] 内且 h2 值 < h1 值（减少了1）。
+    返回 h2 中的倒计时剩余秒数，未检测到返回 None。
+    """
+    def _extract_numbers(h: str) -> List[int]:
+        # 匹配 text="N" 或 text='N'（N 为 1-60 的纯数字）
+        nums = re.findall(r'text=["\'](\d{1,2})["\']', h)
+        return [int(n) for n in nums if 1 <= int(n) <= 60]
+
+    nums1 = _extract_numbers(h1)
+    nums2 = _extract_numbers(h2)
+    for n2 in nums2:
+        for n1 in nums1:
+            if n1 - n2 == 1:   # 恰好减少了1，确认是秒级倒计时
+                return n2
+    return None
+
 
 # 根据动作记录中的信息，模拟用户在设备上执行相应的操作，如点击、输入、滑动等，并在执行过程中进行必要的错误处理和日志记录，以确保探索过程的稳定性和可追踪性。
 def replay_action_record(device, action_record: Dict[str, Any]) -> bool:
@@ -892,6 +1061,29 @@ def _compute_hierarchy_struct_fingerprint(hierarchy_text: str) -> str:
     return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:16]
 
 
+def _safe_future(fut: "concurrent.futures.Future", default: Any) -> Any:
+    """安全获取 Future 结果，异常时返回默认值。"""
+    try:
+        return fut.result()
+    except Exception:
+        return default
+
+
+def _compute_fingerprints_concurrent(
+    hierarchy_text: str,
+    screenshot_path: Optional[str] = None,
+) -> tuple:
+    """并发计算 (fp, struct_fp, dhash_hex)，任一失败则对应返回 ''。"""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        fut_fp     = pool.submit(_hierarchy_fingerprint, hierarchy_text)
+        fut_struct = pool.submit(_compute_hierarchy_struct_fingerprint, hierarchy_text)
+        fut_dhash  = pool.submit(_compute_dhash_hex, screenshot_path) if screenshot_path else None
+        fp        = _safe_future(fut_fp, "")
+        struct_fp = _safe_future(fut_struct, "")
+        dhash_hex = _safe_future(fut_dhash, "") if fut_dhash else ""
+    return fp, struct_fp, dhash_hex
+
+
 def _save_collect_snapshot(
     *,
     page_dir: str,
@@ -928,8 +1120,7 @@ def enqueue_ui_collect_if_new(
     index_path: str,
     ui_collect_queue_size: int,
 ) -> Optional[str]:
-    fp = _hierarchy_fingerprint(hierarchy_text)
-    struct_fp = _compute_hierarchy_struct_fingerprint(hierarchy_text)
+    fp, struct_fp, _ = _compute_fingerprints_concurrent(hierarchy_text)
     if not fp:
         return None
 
@@ -1836,7 +2027,9 @@ def execute_decider_one_step(
         )
 
     elif action == "wait":
-        time.sleep(1.0)
+        logging.info("Decider returned 'wait' — sleeping 2s and skipping step.")
+        time.sleep(2.0)
+        raise WaitActionSkip("wait action — step not recorded")
 
     elif action == "done":
         action_record["status"] = params.get("status", "success")
@@ -1844,12 +2037,11 @@ def execute_decider_one_step(
     else:
         raise ValueError(f"Unsupported action from decider: {action}")
 
-    try:
-        annotate_action_visuals(action, action_record, screenshot_file, output_dir, step_index)
-    except Exception as e:
-        logging.warning(f"Failed to annotate action visuals: {e}")
+    _ANNOTATION_EXECUTOR.submit(
+        _run_annotation_safe, action, action_record, screenshot_file, output_dir, step_index
+    )
 
-    _wait_for_page_loaded(decider_client, decider_model, device, device_type)
+    time.sleep(DEVICE_WAIT_TIME)
     post_hierarchy_text = get_hierarchy_text(device)
 
     return {
@@ -1943,17 +2135,35 @@ def explore_dfs(
             ui_collect_queue_size=ui_collect_queue_size,
         )
 
+    # Layer 1: 无 LLM 规则扫描，优先于 Explorer 处理已知广告/弹窗模式
+    for _rule_attempt in range(popup_dismiss_max_attempts):
+        dismiss_bounds = _find_dismissible_element(hierarchy_text)
+        if dismiss_bounds is None:
+            break
+        x = (dismiss_bounds[0] + dismiss_bounds[2]) // 2
+        y = (dismiss_bounds[1] + dismiss_bounds[3]) // 2
+        device.click(x, y)
+        time.sleep(DEVICE_WAIT_TIME)
+        if screen_cache is not None:
+            screenshot_b64, hierarchy_text = screen_cache.capture(device, device_type, force=True)
+        else:
+            screenshot_b64 = get_screenshot(device, device_type)
+            hierarchy_text = get_hierarchy_text(device)
+        logging.info(
+            "\033[93m[RuleDismiss] clicked (%d,%d) attempt %d\033[0m",
+            x, y, _rule_attempt + 1,
+        )
+
     # OPT-6: 用当前路径（非全局历史）作为 Explorer 上下文，提升语义连贯性
     action_history = list(path_actions) if path_actions else list(actions)
 
     # OPT-6: 从 visited_tasks 取当前页面已探索的任务列表
     if visited_tasks is None:
         visited_tasks = {}
-    current_page_fp = _hierarchy_fingerprint(hierarchy_text)
+    current_page_fp, struct_fp, _ = _compute_fingerprints_concurrent(hierarchy_text)
     already_explored_list = list(visited_tasks.get(current_page_fp, set()))
 
     # OPT-9: 先查 Explorer 缓存
-    struct_fp = _compute_hierarchy_struct_fingerprint(hierarchy_text)
     cached_candidates = None
     if explorer_cache is not None:
         cached_candidates = explorer_cache.get(struct_fp, current_depth, breadth, already_explored_list)
@@ -1999,11 +2209,27 @@ def explore_dfs(
                     f"\033[93m[PopupDismiss] no screen size, pressed back (attempt {_popup_attempt + 1})\033[0m"
                 )
         else:
-            navigate_back(device, device_type)
-            logging.info(
-                f"\033[93m[PopupDismiss] no close_point, pressed back (attempt {_popup_attempt + 1})\033[0m"
-            )
-        _wait_for_page_stable(device)
+            # 无 close_point：先判断是否倒计时广告，若是则等待归零再重检
+            h1 = hierarchy_text
+            time.sleep(1.0)
+            if screen_cache is not None:
+                _, h2 = screen_cache.capture(device, device_type, force=True)
+            else:
+                h2 = get_hierarchy_text(device)
+            remaining = _detect_countdown(h1, h2)
+            if remaining is not None:
+                logging.info(
+                    "\033[93m[PopupDismiss] Countdown ad detected, waiting %ds... (attempt %d)\033[0m",
+                    remaining, _popup_attempt + 1,
+                )
+                time.sleep(remaining + 0.5)   # 等待归零，多留 0.5s 缓冲
+            else:
+                navigate_back(device, device_type)
+                logging.info(
+                    "\033[93m[PopupDismiss] no close_point, no countdown → pressed back (attempt %d)\033[0m",
+                    _popup_attempt + 1,
+                )
+        time.sleep(DEVICE_WAIT_TIME)
         # 刷新状态并重新让 Explorer 判断是否还有弹窗
         if screen_cache is not None:
             screenshot_b64, hierarchy_text = screen_cache.capture(device, device_type, force=True)
@@ -2115,11 +2341,9 @@ def explore_dfs(
         pre_hierarchy_text = get_hierarchy_text(device)
         get_screenshot(device, device_type)  # 更新临时截图文件，用于回溯验证
         pre_screenshot_path = "screenshot-Android.jpg" if device_type == "Android" else "screenshot-Harmony.jpg"
-        pre_struct_fp = _compute_hierarchy_struct_fingerprint(pre_hierarchy_text)
-        try:
-            pre_dhash = _compute_dhash_hex(pre_screenshot_path)
-        except Exception:
-            pre_dhash = ""
+        _, pre_struct_fp, pre_dhash = _compute_fingerprints_concurrent(
+            pre_hierarchy_text, screenshot_path=pre_screenshot_path
+        )
         try:
             # step_result = execute_decider_one_step(
             #     decider_client=explorer_client,
@@ -2185,7 +2409,10 @@ def explore_dfs(
             if screen_cache is not None:
                 screen_cache.invalidate()
 
-            persist_step_output(step_output_dir, app_name, action_record, react_item)
+            _ANNOTATION_EXECUTOR.submit(
+                _persist_step_output_safe, step_output_dir, app_name,
+                dict(action_record), dict(react_item),
+            )
 
             if current_depth + 1 >= depth_limit:
                 path_counter[0] += 1
@@ -2211,11 +2438,9 @@ def explore_dfs(
                     save_hierarchy(device, device_type, path_output_dir, done_index)
                 except Exception as e:
                     logging.warning(f"Failed to save done artifacts for path {path_id:04d}: {e}")
-                persist_outputs(
-                    path_output_dir,
-                    app_name,
-                    full_path_actions,
-                    full_path_reacts,
+                _ANNOTATION_EXECUTOR.submit(
+                    _persist_outputs_safe, path_output_dir, app_name,
+                    list(full_path_actions), list(full_path_reacts),
                 )
             else:
                 explore_dfs(
@@ -2256,6 +2481,19 @@ def explore_dfs(
                     popup_dismiss_max_attempts=popup_dismiss_max_attempts,
                 )
 
+        except WaitActionSkip:
+            # Decider 输出 wait：撤回 step 编号，清理已写文件，跳过本候选不记录
+            step_counter[0] -= 1
+            try:
+                shutil.rmtree(step_output_dir)
+            except Exception:
+                pass
+            logging.info(
+                "\033[93m[Depth %d] Wait action — candidate '%s' skipped, not recorded.\033[0m",
+                current_depth, task,
+            )
+            cand_idx += 1
+            continue
         except Exception as e:
             logging.error(f"Failed to execute candidate at depth {current_depth}: {e}")
 
@@ -2288,12 +2526,11 @@ def explore_dfs(
         else:
             # 三重验证：文本指纹 + 结构指纹 + 视觉dHash，2/3通过则认为回溯成功
             fp_ok = (_stable_text_fingerprint(pre_hierarchy_text) == _stable_text_fingerprint(post_back_hierarchy))
-            struct_ok = (pre_struct_fp == _compute_hierarchy_struct_fingerprint(post_back_hierarchy))
-            try:
-                post_dhash = _compute_dhash_hex(post_back_screenshot_path)
-                visual_ok = (bin(int(pre_dhash, 16) ^ int(post_dhash, 16)).count("1") <= 3) if pre_dhash and post_dhash else fp_ok
-            except Exception:
-                visual_ok = fp_ok  # 视觉比对失败时退化为文本指纹结果
+            _, post_struct_fp_val, post_dhash = _compute_fingerprints_concurrent(
+                post_back_hierarchy, screenshot_path=post_back_screenshot_path
+            )
+            struct_ok = (pre_struct_fp == post_struct_fp_val)
+            visual_ok = (bin(int(pre_dhash, 16) ^ int(post_dhash, 16)).count("1") <= 3) if pre_dhash and post_dhash else fp_ok
             verified = (int(fp_ok) + int(struct_ok) + int(visual_ok)) >= 2
 
         if not verified:
@@ -2326,12 +2563,11 @@ def explore_dfs(
                         break
                     continue
                 r_fp_ok = (_stable_text_fingerprint(pre_hierarchy_text) == _stable_text_fingerprint(replay_hierarchy))
-                r_struct_ok = (pre_struct_fp == _compute_hierarchy_struct_fingerprint(replay_hierarchy))
-                try:
-                    r_dhash = _compute_dhash_hex(post_back_screenshot_path)
-                    r_visual_ok = (bin(int(pre_dhash, 16) ^ int(r_dhash, 16)).count("1") <= 3) if pre_dhash and r_dhash else r_fp_ok
-                except Exception:
-                    r_visual_ok = r_fp_ok
+                _, r_struct_fp_val, r_dhash = _compute_fingerprints_concurrent(
+                    replay_hierarchy, screenshot_path=post_back_screenshot_path
+                )
+                r_struct_ok = (pre_struct_fp == r_struct_fp_val)
+                r_visual_ok = (bin(int(pre_dhash, 16) ^ int(r_dhash, 16)).count("1") <= 3) if pre_dhash and r_dhash else r_fp_ok
                 if (int(r_fp_ok) + int(r_struct_ok) + int(r_visual_ok)) >= 2:
                     recovered = True
                     logging.info("\033[92mFull path replay recovery succeeded on attempt %d.\033[0m", attempt + 1)
@@ -2385,6 +2621,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable_ui_semantic_collect", choices=["on", "off"], default="off", help="是否启用页面图标采集")
     parser.add_argument("--ui_collect_async", choices=["on", "off"], default="on", help="页面采集是否异步执行")
     parser.add_argument("--ui_collect_queue_size", type=int, default=256, help="页面采集任务队列容量")
+    parser.add_argument("--ui_collect_num_workers", type=int, default=1, help="页面采集工作线程数，默认1（兼容原行为）；推荐 2-4")
     parser.add_argument("--ui_collect_drain_on_exit", choices=["on", "off"], default="on", help="退出前是否等待采集队列清空")
     parser.add_argument("--ui_collect_drain_timeout_sec", type=int, default=180, help="退出前等待采集队列清空的超时时间(秒)")
     parser.add_argument("--ui_collect_use_vlm", choices=["on", "off"], default="on", help="页面采集是否启用VLM")
@@ -2492,32 +2729,33 @@ def main() -> None:
     index_lock = threading.Lock()
     collect_queue: Optional["queue.Queue[Dict[str, Any]]"] = None
     collect_stop_event: Optional[threading.Event] = None
-    collect_thread: Optional[threading.Thread] = None
+    collect_threads: List[threading.Thread] = []
 
     if enable_ui_semantic_collect and ui_collect_async:
         collect_queue = queue.Queue(maxsize=args.ui_collect_queue_size)
         collect_stop_event = threading.Event()
-        collect_thread = threading.Thread(
-            target=ui_collect_worker,
-            kwargs={
-                "collect_queue": collect_queue,
-                "stop_event": collect_stop_event,
-                "page_registry": page_registry,
-                "queue_lock": queue_lock,
-                "index_lock": index_lock,
-                "index_path": index_path,
-                "ui_collect_use_vlm": args.ui_collect_use_vlm == "on",
-                "ui_collect_vlm_text_only": args.ui_collect_vlm_text_only == "on",
-                "ui_collect_model": args.ui_collect_vlm_model,
-                "ui_collect_max_items": args.ui_collect_max_items,
-                "ui_collect_max_vlm_calls": args.ui_collect_max_vlm_calls,
-                "ui_collect_min_area": args.ui_collect_min_area,
-                "ui_collect_base_url": ui_collect_base_url,
-                "ui_collect_api_key": ui_collect_api_key,
-            },
-            daemon=True,
-        )
-        collect_thread.start()
+        _worker_kwargs = {
+            "collect_queue": collect_queue,
+            "stop_event": collect_stop_event,
+            "page_registry": page_registry,
+            "queue_lock": queue_lock,
+            "index_lock": index_lock,
+            "index_path": index_path,
+            "ui_collect_use_vlm": args.ui_collect_use_vlm == "on",
+            "ui_collect_vlm_text_only": args.ui_collect_vlm_text_only == "on",
+            "ui_collect_model": args.ui_collect_vlm_model,
+            "ui_collect_max_items": args.ui_collect_max_items,
+            "ui_collect_max_vlm_calls": args.ui_collect_max_vlm_calls,
+            "ui_collect_min_area": args.ui_collect_min_area,
+            "ui_collect_base_url": ui_collect_base_url,
+            "ui_collect_api_key": ui_collect_api_key,
+        }
+        num_workers = max(1, args.ui_collect_num_workers)
+        for _ in range(num_workers):
+            t = threading.Thread(target=ui_collect_worker, kwargs=_worker_kwargs, daemon=True)
+            t.start()
+            collect_threads.append(t)
+        logging.info(f"Started {num_workers} ui_collect_worker thread(s).")
 
     try:
         decider_model = args.decider_model or DECIDER_MODEL_PLACEHOLDER
@@ -2580,12 +2818,15 @@ def main() -> None:
                 )
             if collect_stop_event is not None:
                 collect_stop_event.set()
-            try:
-                collect_queue.put_nowait({"type": "stop"})
-            except Exception:
-                pass
-            if collect_thread is not None:
-                collect_thread.join(timeout=2.0)
+            # 每个 worker 发送一个 stop sentinel，确保各线程可以正常退出
+            for _ in collect_threads:
+                try:
+                    collect_queue.put_nowait({"type": "stop"})
+                except Exception:
+                    pass
+            for t in collect_threads:
+                t.join(timeout=2.0)
+            collect_threads.clear()
         logging.info(f"Auto-search finished. data_dir={data_dir}")
 
 

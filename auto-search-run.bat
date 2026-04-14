@@ -30,12 +30,6 @@ set DATA_DIR=
 set ALLOW_HIERARCHY_TEXT_DECIDER=off
 set ENABLE_UI_SEMANTIC_COLLECT=on
 
-:: 页面加载等待（加载慢的 App 可调大）
-:: PAGE_LOAD_WAIT_SEC:          动作后固定等待秒数
-:: PAGE_LOAD_STABLE_MAX_POLLS:  最多再轮询几次（每次0.5s）等 hierarchy 稳定
-set PAGE_LOAD_WAIT_SEC=1.5
-set PAGE_LOAD_STABLE_MAX_POLLS=6
-
 :: BBox 精炼阈值（换模型/换手机时调整）
 :: BBOX_IOU_THRESHOLD:      IoU >= 此值则用 XML 元素边框（模型越不准确 → 调低，如 0.1）
 :: BBOX_CENTER_DIST_RATIO:  中心距/对角线 <= 此值才匹配（偏差大 → 调高，如 0.15）
@@ -95,8 +89,6 @@ set CMD=python -m runner.mobiagent.auto-search ^
  --ui_collect_max_items "%UI_COLLECT_MAX_ITEMS%" ^
  --ui_collect_max_vlm_calls "%UI_COLLECT_MAX_VLM_CALLS%" ^
  --ui_collect_min_area "%UI_COLLECT_MIN_AREA%" ^
- --page_load_wait_sec "%PAGE_LOAD_WAIT_SEC%" ^
- --page_load_stable_max_polls "%PAGE_LOAD_STABLE_MAX_POLLS%" ^
  --bbox_iou_threshold "%BBOX_IOU_THRESHOLD%" ^
  --bbox_center_dist_ratio "%BBOX_CENTER_DIST_RATIO%" ^
  --bbox_area_ratio_min "%BBOX_AREA_RATIO_MIN%" ^
@@ -109,4 +101,4 @@ if not "%DATA_DIR%"=="" set CMD=%CMD% --data_dir "%DATA_DIR%"
 :: 执行命令
 %CMD%
 
-paused:\cdl\code\MobiAgent\MobiAgent\runner
+pause
