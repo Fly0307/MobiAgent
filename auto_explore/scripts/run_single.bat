@@ -60,12 +60,12 @@ set UI_COLLECT_API_KEY=%OPENROUTER_API_KEY%
 set UI_COLLECT_MAX_ITEMS=32
 set UI_COLLECT_MAX_VLM_CALLS=12
 set UI_COLLECT_MIN_AREA=16
-set PYTHONPATH=%CD%;%PYTHONPATH%
+set PYTHONPATH=%CD%\auto_explore\src;%PYTHONPATH%
 
 echo Running auto-search with app=%APP_NAME% depth=%DEPTH% breadth=%BREADTH% ...
 
 :: 构建命令字符串
-set CMD=python -m runner.mobiagent.auto-search ^
+set CMD=python -m auto_explore.cli.auto_search ^
  --app_name "%APP_NAME%" ^
  --depth "%DEPTH%" ^
  --breadth "%BREADTH%" ^

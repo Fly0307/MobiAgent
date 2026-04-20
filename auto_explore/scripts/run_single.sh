@@ -4,14 +4,18 @@ set -euo pipefail
 # Auto Search 运行参数模板
 # 使用方式：
 # 1) 修改下面变量
-# 2) 执行: bash runner/mobiagent/auto-search-run-template.sh
+# 2) 执行: bash auto_explore/scripts/run_single.sh
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUTO_EXPLORE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${AUTO_EXPLORE_ROOT}/.." && pwd)"
 
 APP_NAME="微博"
 DEPTH=2 # 探索页面的深度，3-4
 BREADTH=2 # 在每一个页面探索的广度，5-10，路径总数最多为BREADTH的DEPTH次方
 
 # Decider 相关参数（使用 DECIDER_BASE_URL）
-DEVICE="Harmony"                 # Android | Harmony
+DEVICE="Android"                 # Android | Harmony
 DECIDER_BASE_URL="http://166.111.53.96:7003/v1"
 DECIDER_MODEL="MobiMind-1.5-4B"
 # Decider API Key：通过环境变量 DECIDER_API_KEY 传入，默认为 "mobiagent-key"
@@ -55,8 +59,12 @@ UI_COLLECT_MAX_VLM_CALLS=12
 UI_COLLECT_MIN_AREA=16
 
 
+export PYTHONPATH="${AUTO_EXPLORE_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+
+cd "${REPO_ROOT}"
+
 CMD=(
-  python -m runner.mobiagent.auto-search
+  python -m auto_explore.cli.auto_search
   --app_name "$APP_NAME"
   --depth "$DEPTH"
   --breadth "$BREADTH"

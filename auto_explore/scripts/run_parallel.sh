@@ -4,25 +4,30 @@ set -euo pipefail
 # 多模拟器 auto-search 运行模板
 # 使用方式：
 # 1) 修改下列变量
-# 2) 执行: bash auto-search-run-parallel-template.sh
+# 2) 执行: bash auto_explore/scripts/run_parallel.sh
 
-APP_NAME="微博"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUTO_EXPLORE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${AUTO_EXPLORE_ROOT}/.." && pwd)"
+
+APP_NAME="淘店"
 DEPTH=2
 BREADTH=2
 
 # 启动前按顺序恢复的 task_name 列表
+# 任务名称可参考: MobileWorld/docs/task_categories.md
+# 这些任务仅用于恢复快照环境，不会改变下面 APP_NAME 的采集目标。
 TASK_NAMES=(
-  "MattermostCreateChannel"
-  "GmailSendEmail"
+  "SearchItemAndCheckoutTask"
 )
 
 # 模拟器来源 1：直接从 JSON 读取
-SIMULATOR_FILE="可用模拟器信息.json"
+SIMULATOR_FILE="${AUTO_EXPLORE_ROOT}/configs/simulators.json"
 
-# 模拟器来源 2：手工追加，格式 name|backend_url|adb_endpoint
+# 模拟器来源 2：手工追加，格式 name|backend_url|adb_endpoint[|init_device]
 # 例如：
 # EXTRA_SIMULATORS=(
-#   "模拟器3|http://127.0.0.1:9002|127.0.0.1:8010"
+#   "模拟器3|http://127.0.0.1:9002|127.0.0.1:8010|emulator-5554"
 # )
 EXTRA_SIMULATORS=()
 
@@ -57,8 +62,12 @@ UI_COLLECT_MAX_ITEMS=32
 UI_COLLECT_MAX_VLM_CALLS=12
 UI_COLLECT_MIN_AREA=16
 
+export PYTHONPATH="${AUTO_EXPLORE_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+
+cd "${REPO_ROOT}"
+
 CMD=(
-  python -m runner.mobiagent.auto_search_multi_runner
+  python -m auto_explore.cli.parallel_runner
   --simulator-file "$SIMULATOR_FILE"
   --app_name "$APP_NAME"
   --depth "$DEPTH"

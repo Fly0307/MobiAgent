@@ -46,6 +46,13 @@ logging.basicConfig(
 # 截图缩放比例
 factor = 0.5
 
+
+def _load_app_config(filename):
+    """从 config 目录加载应用包名配置文件"""
+    config_path = Path(__file__).parent / "config" / filename
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
 # ============ 常数定义 ============
 MAX_STEPS = 15
 MAX_RETRIES = 5
@@ -107,30 +114,7 @@ class AndroidDevice(Device):
             self.d = u2.connect(adb_endpoint)
         else:
             self.d = u2.connect()
-        self.app_package_names = {
-            "携程": "ctrip.android.view",
-            "同城": "com.tongcheng.android",
-            "飞猪": "com.taobao.trip",
-            "去哪儿": "com.Qunar",
-            "华住会": "com.htinns",
-            "饿了么": "me.ele",
-            "支付宝": "com.eg.android.AlipayGphone",
-            "淘宝": "com.taobao.taobao",
-            "京东": "com.jingdong.app.mall",
-            "美团": "com.sankuai.meituan",
-            "滴滴出行": "com.sdu.didi.psnger",
-            "微信": "com.tencent.mm",
-            "微博": "com.sina.weibo",
-            "携程": "ctrip.android.view",
-            "华为商城": "com.vmall.client",
-            "华为视频": "com.huawei.himovie",
-            "华为音乐": "com.huawei.music",
-            "华为应用市场": "com.huawei.appmarket",
-            "拼多多": "com.xunmeng.pinduoduo",
-            "大众点评": "com.dianping.v1",
-            "小红书": "com.xingin.xhs",
-            "浏览器": "com.microsoft.emmx"
-        }
+        self.app_package_names = _load_app_config("apps_android.json")
 
     def start_app(self, app):
         package_name = self.app_package_names.get(app)
@@ -206,50 +190,7 @@ class HarmonyDevice(Device):
     def __init__(self):
         super().__init__()
         self.d = Driver()
-        self.app_package_names = {
-            "携程": "com.ctrip.harmonynext",
-            "飞猪": "com.fliggy.hmos",
-            "IntelliOS": "ohos.hongmeng.intellios",
-            "同城": "com.tongcheng.hmos",
-            "携程旅行": "com.ctrip.harmonynext",
-            "饿了么": "me.ele.eleme",
-            "知乎": "com.zhihu.hmos",
-            "哔哩哔哩": "yylx.danmaku.bili",
-            "微信": "com.tencent.wechat",
-            "小红书": "com.xingin.xhs_hos",
-            "QQ音乐": "com.tencent.hm.qqmusic",
-            "高德地图": "com.amap.hmapp",
-            "淘宝": "com.taobao.taobao4hmos",
-            "微博": "com.sina.weibo.stage",
-            "京东": "com.jd.hm.mall",
-            "飞猪旅行": "com.fliggy.hmos",
-            "天气": "com.huawei.hmsapp.totemweather",
-            "什么值得买": "com.smzdm.client.hmos",
-            "闲鱼": "com.taobao.idlefish4ohos",
-            "慧通差旅": "com.smartcom.itravelhm",
-            "PowerAgent": "com.example.osagent",
-            "航旅纵横": "com.umetrip.hm.app",
-            "滴滴出行": "com.sdu.didi.hmos.psnger",
-            "电子邮件": "com.huawei.hmos.email",
-            "图库": "com.huawei.hmos.photos",
-            "日历": "com.huawei.hmos.calendar",
-            "心声社区": "com.huawei.it.hmxinsheng",
-            "信息": "com.ohos.mms",
-            "文件管理": "com.huawei.hmos.files",
-            "运动健康": "com.huawei.hmos.health",
-            "智慧生活": "com.huawei.hmos.ailife",
-            "豆包": "com.larus.nova.hm",
-            "WeLink": "com.huawei.it.welink",
-            "设置": "com.huawei.hmos.settings",
-            "懂车帝": "com.ss.dcar.auto",
-            "美团外卖": "com.meituan.takeaway",
-            "大众点评": "com.sankuai.dianping",
-            "美团": "com.sankuai.hmeituan",
-            "浏览器": "com.huawei.hmos.browser",
-            "微博": "com.sina.weibo.stage",
-            "饿了么": "me.ele.eleme",
-            "拼多多": "com.xunmeng.pinduoduo.hos"
-        }
+        self.app_package_names = _load_app_config("apps_harmony.json")
 
     def start_app(self, app):
         package_name = self.app_package_names.get(app)

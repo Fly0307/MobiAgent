@@ -246,10 +246,10 @@ Explorer 检测到弹窗 → 点击关闭按钮（或按返回键） → 等待�
 
 ## 5. 输出目录结构
 
-默认输出路径：`runner/mobiagent/data-auto-search/<app_name>/<timestamp>/`
+默认输出路径：`auto_explore/data/<app_name>/<timestamp>/`
 
 ```
-data-auto-search/美团/20260413-153022/
+auto_explore/data/美团/20260413-153022/
 ├── steps/                      # 单步原子结果
 │   ├── step_0001/
 │   │   ├── 1.jpg              # 执行该步前的截图
@@ -415,24 +415,24 @@ if ratio > 0.8:  # sim_threshold 默认 0.8
 **Linux/macOS:**
 ```bash
 # 编辑模板脚本中的参数
-vim auto-search-run-template.sh
+vim auto_explore/scripts/run_single.sh
 
 # 设置环境变量
 export OPENROUTER_API_KEY="your-key-here"
 
 # 执行
-bash auto-search-run-template.sh
+bash auto_explore/scripts/run_single.sh
 ```
 
 **Windows:**
 ```cmd
-auto-search-run.bat
+auto_explore/scripts/run_single.bat
 ```
 
 ### 7.2 直接命令行
 
 ```bash
-python -m runner.mobiagent.auto-search \
+PYTHONPATH=auto_explore/src python -m auto_explore.cli.auto_search \
   --app_name "美团" \
   --depth 3 \
   --breadth 4 \
@@ -483,7 +483,7 @@ python -m runner.mobiagent.auto-search \
 1. **App 映射：** `--app_name` 必须在设备的 App 映射表中存在
 2. **设备连通性：** 确认 ADB 连接正常（`adb devices` 可见）
 3. **API 费用：** Explorer 和 Decider 都调用远程模型，注意控制预算
-4. **存储清理：** 大规模探索会生成大量截图，定期清理 `data-auto-search/` 目录
+4. **存储清理：** 大规模探索会生成大量截图，定期清理 `auto_explore/data/` 目录
 5. **后台限制：** 某些 Android 厂商会限制后台应用的 CPU/内存，请在开发者选项中关闭电池优化
 
 ---
@@ -527,7 +527,7 @@ python -m runner.mobiagent.auto-search \
 │  ┌──────────────────────────────────────────────────────────────┐  │
 │  │                      数据持久层                               │  │
 │  │                                                              │  │
-│  │  data-auto-search/<app>/<timestamp>/                         │  │
+│  │  auto_explore/data/<app>/<timestamp>/                        │  │
 │  │    ├── steps/   (单步原子结果)                                │  │
 │  │    ├── paths/   (完整 DFS 路径)                               │  │
 │  │    └── ui-pages/ (页面图标采集)                               │  │
@@ -541,10 +541,10 @@ python -m runner.mobiagent.auto-search \
 
 | 文件 | 说明 |
 |------|------|
-| `runner/mobiagent/auto-search.py` | Auto-Search 核心实现（~2600 行） |
-| `runner/mobiagent/README_auto_search.md` | 官方简要说明 |
-| `auto-search-run-template.sh` | Linux/macOS 运行参数模板 |
-| `auto-search-run.bat` | Windows 运行参数模板 |
+| `auto_explore/src/auto_explore/cli/auto_search.py` | Auto-Search 核心实现 |
+| `auto_explore/README.md` | Auto Explore 使用说明 |
+| `auto_explore/scripts/run_single.sh` | Linux/macOS 运行参数模板 |
+| `auto_explore/scripts/run_single.bat` | Windows 运行参数模板 |
 | `runner/mobiagent/mobiagent.py` | Decider 模型调用 + 设备控制基础 |
 | `collect/auto/ui_semantic_boxer` | UI 语义采集模块 |
 | `prompts/e2e_qwen3_system.md` | Decider 系统提示模板 |
