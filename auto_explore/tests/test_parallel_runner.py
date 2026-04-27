@@ -2,6 +2,10 @@ import json
 from pathlib import Path
 from unittest import TestCase, mock
 
+from test_support import install_test_stubs
+
+install_test_stubs()
+
 from auto_explore.cli.parallel_runner import (
     SimulatorConfig,
     build_auto_search_command,
@@ -172,4 +176,7 @@ class ParallelRunnerTests(TestCase):
         self.assertIn("--adb_endpoint", cmd)
         self.assertEqual(cmd[cmd.index("--adb_endpoint") + 1], "127.0.0.1:8000")
         self.assertIn("--data_dir", cmd)
-        self.assertEqual(cmd[cmd.index("--data_dir") + 1], "/tmp/auto-explore-test/模拟器1")
+        self.assertEqual(
+            cmd[cmd.index("--data_dir") + 1],
+            str(Path("/tmp/auto-explore-test") / "模拟器1"),
+        )

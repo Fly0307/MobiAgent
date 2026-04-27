@@ -1,0 +1,20 @@
+{
+  "input_path": "d:\\cdl\\MobiAgent\\auto_explore\\results\\ablation\\20260426_004631_淘宝\\E0_full\\run_001",
+  "target_level": "paths",
+  "judge_model": "qwen3vl",
+  "judge_base_url": "https://models.sjtu.edu.cn/api/v1",
+  "judge_mode": "path_multimodal",
+  "evaluated_at": "2026-04-27T20:09:14",
+  "sample_count": 1,
+  "success_count": 0,
+  "error_count": 1,
+  "averages": {},
+  "samples": [
+    {
+      "sample_id": "path_0001",
+      "trace_dir": "D:\\cdl\\MobiAgent\\auto_explore\\results\\ablation\\20260426_004631_淘宝\\E0_full\\run_001\\data\\paths\\path_0001",
+      "status": "error",
+      "error": "无法解析 JSON 响应: 响应格式不正确"
+    }
+  ]
+}

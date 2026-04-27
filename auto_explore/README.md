@@ -11,6 +11,7 @@
 
 - `python -m auto_explore.cli.auto_search`
 - `python -m auto_explore.cli.parallel_runner`
+- `python -m auto_explore.eval.cli`
 
 ## 目录说明
 
@@ -444,3 +445,37 @@ export OPENROUTER_API_KEY="your-openrouter-key"
 PYTHONPATH=auto_explore/src python -m auto_explore.cli.auto_search --help
 PYTHONPATH=auto_explore/src python -m auto_explore.cli.parallel_runner --help
 ```
+
+## 10. 评测现有轨迹
+
+如果已经有 `auto_explore/results/...` 下的轨迹结果，可以直接运行评测：
+
+```bash
+PYTHONPATH=auto_explore/src python -m auto_explore.eval.cli \
+  --input_path auto_explore/results/single/20260424_180926_淘宝 \
+  --target_level auto \
+  --judge_model qwen3vl
+```
+
+Windows 下也可以直接运行：
+
+```bat
+set SJTU_API_KEY=your-sjtu-key
+auto_explore\scripts\run_eval.bat
+```
+
+其中 `run_eval.bat` 默认使用 `target_level=auto`，会优先评估 `paths/`，如果当前结果目录没有 `path_*` 样本，就自动回落到 `steps/`。
+
+## Multimodal Path Eval
+
+`auto_explore.eval.cli` also supports a dedicated path-level multimodal judge mode:
+
+```bash
+PYTHONPATH=auto_explore/src python -m auto_explore.eval.cli \
+  --input_path auto_explore/results/ablation/20260423_151917_淘宝/E0_full/run_001 \
+  --target_level paths \
+  --judge_mode path_multimodal \
+  --judge_model qwen3vl
+```
+
+This mode is path-only and expects numbered screenshots inside each `path_*` directory. It does not support `step_*` evaluation.

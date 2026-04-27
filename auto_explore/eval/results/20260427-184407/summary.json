@@ -1,0 +1,49 @@
+{
+  "input_path": "d:\\cdl\\MobiAgent\\auto_explore\\results\\single\\20260424_180926_淘宝",
+  "target_level": "auto",
+  "judge_model": "qwen3vl",
+  "judge_base_url": "https://models.sjtu.edu.cn/api/v1",
+  "evaluated_at": "2026-04-27T18:44:07",
+  "sample_count": 1,
+  "success_count": 1,
+  "error_count": 0,
+  "averages": {
+    "trajectory_completeness_score": 2.0,
+    "reasoning_quality_score": 3.0,
+    "overall_score": 2.0
+  },
+  "samples": [
+    {
+      "trajectory_completeness_score": 2,
+      "reasoning_quality_score": 3,
+      "subscores": {
+        "goal_coverage": 1,
+        "step_coherence": 1,
+        "action_reason_alignment": 3,
+        "groundedness": 3
+      },
+      "strengths": [
+        "推理与动作对齐，明确说明了点击目标",
+        "推理内容基于当前界面，具有一定的 groundedness"
+      ],
+      "issues": [
+        "轨迹仅包含一步，未形成完整探索路径，缺乏闭环",
+        "推理内容重复且空洞，存在自我重复，缺乏深度分析",
+        "未覆盖任务的完整目标，仅执行了第一步，未体现后续探索"
+      ],
+      "summary": "轨迹仅完成单步点击操作，推理虽对齐动作但内容空洞，整体完整性极低，未形成有效探索单元。",
+      "overall_score": 2,
+      "sample_id": "step_0001",
+      "sample_kind": "step",
+      "trace_dir": "d:\\cdl\\MobiAgent\\auto_explore\\results\\single\\20260424_180926_淘宝\\steps\\step_0001",
+      "app_name": "淘宝",
+      "task_description": "Open 淘宝, Step 1: 点击底部导航栏的'我的淘宝'图标",
+      "action_count": 1,
+      "step_count": 1,
+      "evaluated_at": "2026-04-27T18:44:07",
+      "judge_model": "qwen3vl",
+      "judge_base_url": "https://models.sjtu.edu.cn/api/v1",
+      "status": "ok"
+    }
+  ]
+}

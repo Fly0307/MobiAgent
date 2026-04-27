@@ -2,6 +2,7 @@ import difflib
 import hashlib
 import json
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -13,15 +14,185 @@ from auto_explore.core.fingerprints import (
     _collect_struct_tokens_from_xml,
 )
 from auto_explore.core.prompting import build_explorer_prompt
-from auto_explore.core.settings import API_TIMEOUT, EXPLORER_MAX_TOKENS, MAX_RETRIES
+from auto_explore.core.settings import API_TIMEOUT, EXPLORER_MAX_TOKENS, EXPLORER_TEMPERATURE, MAX_RETRIES
+
+
+def _truncate_for_log(text: str, limit: int = 160) -> str:
+    text = text.replace("\r", "\\r").replace("\n", "\\n")
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
+def _strip_code_fence(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, count=1, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped, count=1)
+    return stripped.strip()
+
+
+def _extract_first_balanced_json_object(text: str) -> Optional[str]:
+    start_idx = text.find("{")
+    if start_idx == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(start_idx, len(text)):
+        ch = text[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start_idx : idx + 1]
+    return None
+
+
+def _build_parse_variants(raw_text: str) -> List[str]:
+    variants: List[str] = []
+    seen: set[str] = set()
+
+    def add(value: Optional[str]) -> None:
+        if not value:
+            return
+        candidate = value.strip()
+        if not candidate or candidate in seen:
+            return
+        seen.add(candidate)
+        variants.append(candidate)
+
+    stripped = raw_text.strip()
+    fence_stripped = _strip_code_fence(stripped)
+
+    add(stripped)
+    add(fence_stripped)
+
+    fenced_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", stripped, flags=re.IGNORECASE)
+    if fenced_match:
+        add(fenced_match.group(1))
+
+    add(_extract_first_balanced_json_object(stripped))
+    if fence_stripped != stripped:
+        add(_extract_first_balanced_json_object(fence_stripped))
+
+    return variants
+
+
+def _compute_json_balance(text: str) -> Dict[str, Any]:
+    brace_balance = 0
+    bracket_balance = 0
+    in_string = False
+    escape = False
+
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            brace_balance += 1
+        elif ch == "}":
+            brace_balance -= 1
+        elif ch == "[":
+            bracket_balance += 1
+        elif ch == "]":
+            bracket_balance -= 1
+
+    return {
+        "brace_balance": brace_balance,
+        "bracket_balance": bracket_balance,
+        "unterminated_string": in_string,
+    }
+
+
+def _build_response_diagnostics(raw_text: str, *, finish_reason: Optional[str] = None) -> Dict[str, Any]:
+    stripped = raw_text.strip()
+    balance = _compute_json_balance(stripped)
+    has_code_fence = "```" in stripped
+    likely_truncated = (
+        finish_reason == "length"
+        or balance["brace_balance"] > 0
+        or balance["bracket_balance"] > 0
+        or balance["unterminated_string"]
+        or (stripped.startswith("```") and stripped.count("```") == 1)
+    )
+    return {
+        "raw_length": len(raw_text),
+        "has_code_fence": has_code_fence,
+        "brace_balance": balance["brace_balance"],
+        "bracket_balance": balance["bracket_balance"],
+        "unterminated_string": balance["unterminated_string"],
+        "finish_reason": finish_reason or "",
+        "head": _truncate_for_log(stripped[:160]),
+        "tail": _truncate_for_log(stripped[-160:]),
+        "likely_truncated": likely_truncated,
+    }
+
+
+def _log_response_diagnostics(diagnostics: Dict[str, Any], *, attempt: int) -> None:
+    logging.error(
+        "Explorer response diagnostics: attempt=%s len=%s fence=%s brace_balance=%s "
+        "bracket_balance=%s unterminated_string=%s finish_reason=%s",
+        attempt,
+        diagnostics["raw_length"],
+        diagnostics["has_code_fence"],
+        diagnostics["brace_balance"],
+        diagnostics["bracket_balance"],
+        diagnostics["unterminated_string"],
+        diagnostics["finish_reason"] or "unknown",
+    )
+    logging.error("Explorer response preview head=%s", diagnostics["head"])
+    logging.error("Explorer response preview tail=%s", diagnostics["tail"])
+
+
+def _parse_explorer_response_content(content: Any, *, finish_reason: Optional[str], attempt: int) -> Dict[str, Any]:
+    raw_text = content if isinstance(content, str) else str(content or "")
+    diagnostics = _build_response_diagnostics(raw_text, finish_reason=finish_reason)
+
+    for variant in _build_parse_variants(raw_text):
+        try:
+            return json.loads(variant)
+        except json.JSONDecodeError:
+            try:
+                parsed = robust_json_loads(variant)
+                if isinstance(parsed, dict) and ("candidates" in parsed or "popup" in parsed):
+                    return parsed
+            except Exception:
+                continue
+
+    _log_response_diagnostics(diagnostics, attempt=attempt)
+    if diagnostics["likely_truncated"]:
+        raise ValueError("疑似截断/格式不完整的 JSON 响应")
+    raise ValueError("无法解析 JSON 响应，可能包含额外包装或格式污染")
 
 
 def get_hierarchy_text(device) -> str:
     try:
-        h = device.dump_hierarchy()
-        if isinstance(h, str):
-            return h
-        return json.dumps(h, ensure_ascii=False)
+        hierarchy = device.dump_hierarchy()
+        if isinstance(hierarchy, str):
+            return hierarchy
+        return json.dumps(hierarchy, ensure_ascii=False)
     except Exception as e:
         logging.warning(f"Failed to dump hierarchy for explorer: {e}")
         return ""
@@ -86,9 +257,10 @@ def _deduplicate_candidates(
 
 
 class ExplorerCache:
-    def __init__(self, ttl_sec: float = 300.0):
+    def __init__(self, ttl_sec: float = 300.0, metrics=None):
         self._cache: Dict[str, Any] = {}
         self._ttl = ttl_sec
+        self._metrics = metrics
 
     def _make_key(
         self,
@@ -109,7 +281,10 @@ class ExplorerCache:
     ) -> Optional[List[Dict]]:
         key = self._make_key(struct_fp, depth, breadth, already_explored)
         entry = self._cache.get(key)
-        if entry and (time.time() - entry["ts"]) < self._ttl:
+        hit = bool(entry and (time.time() - entry["ts"]) < self._ttl)
+        if self._metrics is not None:
+            self._metrics.record_explorer_cache_lookup(hit)
+        if hit:
             return list(entry["candidates"])
         return None
 
@@ -126,15 +301,23 @@ class ExplorerCache:
 
 
 class ScreenStateCache:
-    def __init__(self, staleness_sec: float = 0.3):
+    def __init__(self, staleness_sec: float = 0.3, metrics=None):
         self._screenshot_b64: Optional[str] = None
         self._hierarchy_text: Optional[str] = None
         self._last_capture: float = 0.0
         self._staleness = staleness_sec
+        self._metrics = metrics
 
     def capture(self, device, device_type: str, force: bool = False):
         now = time.time()
-        if force or self._screenshot_b64 is None or (now - self._last_capture) > self._staleness:
+        should_refresh = (
+            force
+            or self._screenshot_b64 is None
+            or (now - self._last_capture) > self._staleness
+        )
+        if self._metrics is not None:
+            self._metrics.record_screen_cache_lookup(not should_refresh)
+        if should_refresh:
             self._screenshot_b64 = get_screenshot(device, device_type)
             self._hierarchy_text = get_hierarchy_text(device)
             self._last_capture = now
@@ -163,6 +346,8 @@ def call_explorer_model(
     breadth: int,
     action_history: List[Dict[str, Any]],
     already_explored: Optional[List[str]] = None,
+    metrics=None,
+    trace_meta: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     prompt = build_explorer_prompt(depth, breadth, hierarchy_text, action_history, already_explored=already_explored)
 
@@ -179,32 +364,54 @@ def call_explorer_model(
         }
     ]
 
+    timeline: Dict[str, Any] = dict(trace_meta or {})
+    if metrics is not None:
+        timeline.setdefault("phase", "explorer")
+        timeline.setdefault("T0", metrics.relative_time())
+        timeline.setdefault("T1", timeline["T0"])
+
     last_err: Optional[Exception] = None
     for attempt in range(MAX_RETRIES):
         try:
+            call_start = time.perf_counter()
+            if metrics is not None:
+                timeline["attempt"] = attempt + 1
+                timeline["T2"] = metrics.relative_time(call_start)
             response = explorer_client.chat.completions.create(
                 model=explorer_model,
                 messages=messages,
                 timeout=API_TIMEOUT,
                 max_tokens=EXPLORER_MAX_TOKENS,
-                temperature=0.4 + attempt * 0.2,
+                temperature=EXPLORER_TEMPERATURE,
             )
-            content = response.choices[0].message.content
-            parsed = robust_json_loads(content)
+            choice = response.choices[0]
+            finish_reason = getattr(choice, "finish_reason", None)
+            call_end = time.perf_counter()
+            if metrics is not None:
+                metrics.record_explorer_call(call_end - call_start)
+                timeline["T3"] = metrics.relative_time(call_end)
+                timeline["T4"] = metrics.relative_time(call_end)
+                timeline["T5"] = None
+                timeline["T6"] = None
+                timeline["t3_note"] = "non_streaming_response"
+            if finish_reason and finish_reason != "stop":
+                logging.warning("Explorer finish_reason=%s on attempt=%s", finish_reason, attempt + 1)
+            content = choice.message.content
+            parsed = _parse_explorer_response_content(content, finish_reason=finish_reason, attempt=attempt + 1)
             candidates = parsed.get("candidates", [])
             if not isinstance(candidates, list):
                 raise ValueError("`candidates` must be a list")
 
             normalized = []
-            for i, c in enumerate(candidates[:breadth], 1):
-                task = str(c.get("single_step_task", "")).strip()
+            for i, candidate in enumerate(candidates[:breadth], 1):
+                task = str(candidate.get("single_step_task", "")).strip()
                 if not task:
                     continue
                 normalized.append(
                     {
-                        "rank": c.get("rank", i),
+                        "rank": candidate.get("rank", i),
                         "single_step_task": task,
-                        "reason": str(c.get("reason", "")).strip(),
+                        "reason": str(candidate.get("reason", "")).strip(),
                     }
                 )
 
@@ -220,12 +427,18 @@ def call_explorer_model(
                 else:
                     popup_info = {"detected": True, "close_point": None}
 
+            if metrics is not None:
+                timeline["candidate_count"] = len(normalized)
+                metrics.record_timing_trace(timeline)
             return normalized, popup_info
         except Exception as e:
             last_err = e
             logging.warning(f"Explorer model parse/call failed (attempt={attempt + 1}): {e}")
             time.sleep(1.2)
 
+    if metrics is not None:
+        timeline["error"] = str(last_err)
+        metrics.record_timing_trace(timeline)
     raise RuntimeError(f"Explorer model failed after retries: {last_err}")
 
 

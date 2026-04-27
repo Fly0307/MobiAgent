@@ -9,8 +9,17 @@ from typing import Any, Dict, List, Optional
 
 from auto_explore.adapters.device import AndroidDevice, HarmonyDevice
 from auto_explore.core import settings
+from auto_explore.core.artifacts import flush_artifact_tasks
 from auto_explore.core.dfs import explore_dfs, init_decider_client, init_explorer_client
 from auto_explore.core.explorer import ExplorerCache, ScreenStateCache
+from auto_explore.core.runtime import (
+    FeatureFlags,
+    MetricsCollector,
+    RuntimeContext,
+    add_feature_flag_args,
+    build_metrics_payload,
+    write_metrics_payload,
+)
 from auto_explore.core.ui_collect import (
     _load_ui_page_index,
     _mark_unfinished_collect_tasks,
@@ -25,70 +34,73 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 DECIDER_MODEL_PLACEHOLDER = settings.DECIDER_MODEL_PLACEHOLDER
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MobiAgent Auto Search (DFS + backtracking)")
-    parser.add_argument("--app_name", type=str, required=True, help="目标App名称（与设备映射一致）")
-    parser.add_argument("--depth", type=int, required=True, help="探索深度 D")
-    parser.add_argument("--breadth", type=int, required=True, help="每层探索广度 H")
+    parser.add_argument("--app_name", type=str, required=True, help="Target app name")
+    parser.add_argument("--depth", type=int, required=True, help="DFS depth")
+    parser.add_argument("--breadth", type=int, required=True, help="DFS breadth")
 
-    parser.add_argument("--device", type=str, default="Android", choices=["Android", "Harmony"], help="设备类型")
-    parser.add_argument("--adb_endpoint", type=str, default="", help="Android 设备 ADB 连接地址，例如 127.0.0.1:5555")
-    parser.add_argument("--service_ip", type=str, default="localhost", help="Decider 服务IP")
-    parser.add_argument("--decider_port", type=int, default=8000, help="Decider 服务端口")
+    parser.add_argument("--device", type=str, default="Android", choices=["Android", "Harmony"], help="Device type")
+    parser.add_argument("--adb_endpoint", type=str, default="", help="Android ADB endpoint, for example 127.0.0.1:5555")
+    parser.add_argument("--service_ip", type=str, default="localhost", help="Decider service IP")
+    parser.add_argument("--decider_port", type=int, default=8000, help="Decider service port")
 
-    parser.add_argument("--decider_api_key", type=str, default=os.getenv("DECIDER_API_KEY", "mobiagent-key"), help="Decider API Key")
-    parser.add_argument("--decider_base_url", type=str, default="", help="Decider Base URL（优先于 service_ip+port）")
-    parser.add_argument("--decider_model", type=str, default="", help="Decider 模型名（为空时使用占位符）")
+    parser.add_argument("--decider_api_key", type=str, default=os.getenv("DECIDER_API_KEY", "mobiagent-key"), help="Decider API key")
+    parser.add_argument("--decider_base_url", type=str, default="", help="Decider base URL")
+    parser.add_argument("--decider_model", type=str, default="", help="Decider model name")
 
-    parser.add_argument("--openrouter_base_url", type=str, default="https://openrouter.ai/api/v1", help="Explorer 的 Base URL")
-    parser.add_argument("--openrouter_api_key", type=str, default=os.getenv("OPENROUTER_API_KEY", ""), help="OpenRouter API Key")
-    parser.add_argument("--explorer_model", type=str, default="google/gemini-3-flash-preview", help="通用大模型名称")
+    parser.add_argument("--openrouter_base_url", type=str, default="https://openrouter.ai/api/v1", help="Explorer base URL")
+    parser.add_argument("--openrouter_api_key", type=str, default=os.getenv("OPENROUTER_API_KEY", ""), help="Explorer API key")
+    parser.add_argument("--explorer_model", type=str, default="google/gemini-3-flash-preview", help="Explorer model name")
 
-    parser.add_argument("--use_qwen3", choices=["on", "off"], default="on", help="是否按Qwen3坐标格式换算")
+    parser.add_argument("--use_qwen3", choices=["on", "off"], default="on", help="Whether to use Qwen3 coordinate conversion")
     parser.add_argument(
         "--allow_hierarchy_text_decider",
         choices=["on", "off"],
         default="on",
-        help="是否允许使用层级文本作为 decider 输出动作",
+        help="Allow hierarchy-text direct grounding before decider calls",
     )
-    parser.add_argument("--data_dir", type=str, default=None, help="结果目录")
-    parser.add_argument("--enable_ui_semantic_collect", choices=["on", "off"], default="off", help="是否启用页面图标采集")
-    parser.add_argument("--ui_collect_async", choices=["on", "off"], default="on", help="页面采集是否异步执行")
-    parser.add_argument("--ui_collect_queue_size", type=int, default=256, help="页面采集任务队列容量")
-    parser.add_argument("--ui_collect_num_workers", type=int, default=1, help="页面采集工作线程数，默认1（兼容原行为）；推荐 2-4")
-    parser.add_argument("--ui_collect_drain_on_exit", choices=["on", "off"], default="on", help="退出前是否等待采集队列清空")
-    parser.add_argument("--ui_collect_drain_timeout_sec", type=int, default=180, help="退出前等待采集队列清空的超时时间(秒)")
-    parser.add_argument("--ui_collect_use_vlm", choices=["on", "off"], default="on", help="页面采集是否启用VLM")
-    parser.add_argument("--ui_collect_vlm_text_only", choices=["on", "off"], default="off", help="页面采集文本是否全走VLM")
-    parser.add_argument("--ui_collect_vlm_model", type=str, default="qwen/qwen3-vl-30b-a3b-instruct", help="页面采集VLM模型")
-    parser.add_argument("--ui_collect_base_url", type=str, default="", help="页面采集 VLM 的 Base URL；为空时复用 openrouter_base_url")
-    parser.add_argument("--ui_collect_api_key", type=str, default="", help="页面采集 VLM 的 API Key；为空时复用 openrouter_api_key")
-    parser.add_argument("--ui_collect_max_items", type=int, default=32, help="页面采集最多元素数")
-    parser.add_argument("--ui_collect_max_vlm_calls", type=int, default=12, help="页面采集VLM调用预算")
-    parser.add_argument("--ui_collect_min_area", type=int, default=16, help="页面采集最小框面积")
-    parser.add_argument("--page_load_wait_sec", type=float, default=1.5, help="动作后固定等待秒数（等页面开始渲染）")
-    parser.add_argument("--page_load_stable_max_polls", type=int, default=6, help="页面稳定轮询最大次数（每次0.5s，总最大等待=次数×0.5s）")
-    parser.add_argument("--bbox_iou_threshold", type=float, default=0.3, help="BBox精炼IoU阈值(0~1)，模型坐标越不准确则调低")
-    parser.add_argument("--bbox_center_dist_ratio", type=float, default=0.08, help="BBox精炼中心距/对角线比例，模型偏差大则调高")
-    parser.add_argument("--bbox_area_ratio_min", type=float, default=0.5, help="BBox精炼面积比下限")
-    parser.add_argument("--bbox_area_ratio_max", type=float, default=2.0, help="BBox精炼面积比上限")
-    parser.add_argument("--popup_dismiss_max_attempts", type=int, default=2, help="弹窗自动关闭最大尝试次数，0 表示禁用")
-    return parser.parse_args()
+    parser.add_argument("--data_dir", type=str, default=None, help="Output directory")
+    parser.add_argument("--metrics_output_path", type=str, default="", help="Path to write metrics.json")
+    parser.add_argument("--experiment_tag", type=str, default="default", help="Experiment tag written into metrics.json")
+    parser.add_argument("--enable_ui_semantic_collect", choices=["on", "off"], default="off", help="Enable UI semantic collection")
+    parser.add_argument("--ui_collect_async", choices=["on", "off"], default="on", help="Run UI semantic collection asynchronously")
+    parser.add_argument("--ui_collect_queue_size", type=int, default=256, help="UI collection queue size")
+    parser.add_argument("--ui_collect_num_workers", type=int, default=1, help="UI collection worker count")
+    parser.add_argument("--ui_collect_drain_on_exit", choices=["on", "off"], default="on", help="Drain UI collection queue before exit")
+    parser.add_argument("--ui_collect_drain_timeout_sec", type=int, default=180, help="UI collection drain timeout in seconds")
+    parser.add_argument("--ui_collect_use_vlm", choices=["on", "off"], default="on", help="Enable VLM for UI collection")
+    parser.add_argument("--ui_collect_vlm_text_only", choices=["on", "off"], default="off", help="Use VLM text only in UI collection")
+    parser.add_argument("--ui_collect_vlm_model", type=str, default="qwen/qwen3-vl-30b-a3b-instruct", help="UI collection VLM model")
+    parser.add_argument("--ui_collect_base_url", type=str, default="", help="UI collection VLM base URL")
+    parser.add_argument("--ui_collect_api_key", type=str, default="", help="UI collection VLM API key")
+    parser.add_argument("--ui_collect_max_items", type=int, default=32, help="Max UI items collected per page")
+    parser.add_argument("--ui_collect_max_vlm_calls", type=int, default=12, help="Max VLM calls for UI collection")
+    parser.add_argument("--ui_collect_min_area", type=int, default=16, help="Minimum area for UI collection boxes")
+    parser.add_argument("--page_load_wait_sec", type=float, default=1.5, help="Fixed post-action wait before load checks")
+    parser.add_argument("--page_load_stable_max_polls", type=int, default=6, help="Max number of page stable polls")
+    parser.add_argument("--bbox_iou_threshold", type=float, default=0.3, help="BBox refine IoU threshold")
+    parser.add_argument("--bbox_center_dist_ratio", type=float, default=0.08, help="BBox refine center distance ratio")
+    parser.add_argument("--bbox_area_ratio_min", type=float, default=0.5, help="BBox refine min area ratio")
+    parser.add_argument("--bbox_area_ratio_max", type=float, default=2.0, help="BBox refine max area ratio")
+    parser.add_argument("--popup_dismiss_max_attempts", type=int, default=2, help="Max popup dismiss attempts")
+    add_feature_flag_args(parser)
+    return parser.parse_args(argv)
 
 
 def _validate_args(args: argparse.Namespace) -> None:
     if args.depth <= 0:
-        raise ValueError("depth 必须 > 0")
+        raise ValueError("depth must be > 0")
     if args.breadth <= 0:
-        raise ValueError("breadth 必须 > 0")
+        raise ValueError("breadth must be > 0")
     if not args.openrouter_api_key:
-        raise ValueError("请通过 --openrouter_api_key 或环境变量 OPENROUTER_API_KEY 提供密钥")
+        raise ValueError("Please provide OPENROUTER_API_KEY or --openrouter_api_key")
     if args.ui_collect_vlm_text_only == "on" and args.ui_collect_use_vlm != "on":
         raise ValueError("ui_collect_vlm_text_only=on requires ui_collect_use_vlm=on")
     if args.ui_collect_queue_size <= 0:
-        raise ValueError("ui_collect_queue_size 必须 > 0")
+        raise ValueError("ui_collect_queue_size must be > 0")
     if args.ui_collect_drain_timeout_sec < 0:
-        raise ValueError("ui_collect_drain_timeout_sec 必须 >= 0")
+        raise ValueError("ui_collect_drain_timeout_sec must be >= 0")
 
 
 def _apply_runtime_overrides(args: argparse.Namespace) -> None:
@@ -107,20 +119,29 @@ def _resolve_data_dir(args: argparse.Namespace) -> str:
     return str(Path(__file__).resolve().parents[3] / "data" / args.app_name / timestamp)
 
 
+def _resolve_metrics_output_path(args: argparse.Namespace, data_dir: str) -> str:
+    if args.metrics_output_path:
+        return args.metrics_output_path
+    return str(Path(data_dir) / "metrics.json")
+
+
 def _init_device(args: argparse.Namespace):
     if args.device == "Android":
         return AndroidDevice(adb_endpoint=args.adb_endpoint or None)
     return HarmonyDevice()
 
 
-def main() -> None:
-    args = parse_args()
+def run(args: argparse.Namespace) -> Dict[str, Any]:
     _validate_args(args)
     _apply_runtime_overrides(args)
 
     data_dir = _resolve_data_dir(args)
     os.makedirs(data_dir, exist_ok=True)
+    metrics_output_path = _resolve_metrics_output_path(args, data_dir)
     device = _init_device(args)
+    feature_flags = FeatureFlags.from_namespace(args)
+    metrics = MetricsCollector()
+    runtime = RuntimeContext(features=feature_flags, metrics=metrics)
 
     explorer_base_url = args.openrouter_base_url
     explorer_api_key = args.openrouter_api_key
@@ -136,6 +157,8 @@ def main() -> None:
     ui_collect_drain_on_exit = args.ui_collect_drain_on_exit == "on"
     logging.info("Explorer provider base_url=%s", explorer_base_url)
     logging.info("UI collect provider base_url=%s", ui_collect_base_url)
+    logging.info("Experiment tag=%s", args.experiment_tag)
+    logging.info("Feature flags=%s", feature_flags)
 
     logging.info("Starting app: %s", args.app_name)
     device.start_app(args.app_name)
@@ -145,14 +168,17 @@ def main() -> None:
     reacts: List[Dict[str, Any]] = []
     step_counter = [0]
     path_counter = [0]
+    partial_path_counter = [0]
     page_counter = [1]
 
     steps_dir = os.path.join(data_dir, "steps")
     paths_dir = os.path.join(data_dir, "paths")
+    partial_paths_dir = os.path.join(data_dir, "partial_paths")
     ui_pages_dir = os.path.join(data_dir, "ui-pages")
     index_path = os.path.join(ui_pages_dir, "pages_index.json")
     os.makedirs(steps_dir, exist_ok=True)
     os.makedirs(paths_dir, exist_ok=True)
+    os.makedirs(partial_paths_dir, exist_ok=True)
     os.makedirs(ui_pages_dir, exist_ok=True)
 
     page_registry: Dict[str, Dict[str, Any]] = _load_ui_page_index(index_path)
@@ -192,8 +218,8 @@ def main() -> None:
     try:
         decider_model = args.decider_model or DECIDER_MODEL_PLACEHOLDER
         visited_tasks: Dict[str, set] = {}
-        explorer_cache = ExplorerCache(ttl_sec=300.0)
-        screen_cache = ScreenStateCache(staleness_sec=0.3)
+        explorer_cache = ExplorerCache(ttl_sec=300.0, metrics=metrics) if feature_flags.explorer_cache else None
+        screen_cache = ScreenStateCache(staleness_sec=0.3, metrics=metrics) if feature_flags.screen_cache else None
 
         explore_dfs(
             app_name=args.app_name,
@@ -213,9 +239,11 @@ def main() -> None:
             reacts=reacts,
             step_counter=step_counter,
             path_counter=path_counter,
+            partial_path_counter=partial_path_counter,
             page_counter=page_counter,
             steps_dir=steps_dir,
             paths_dir=paths_dir,
+            partial_paths_dir=partial_paths_dir,
             enable_ui_semantic_collect=enable_ui_semantic_collect and ui_collect_async,
             ui_pages_dir=ui_pages_dir,
             page_registry=page_registry,
@@ -225,10 +253,11 @@ def main() -> None:
             index_path=index_path,
             ui_collect_async=ui_collect_async,
             ui_collect_queue_size=args.ui_collect_queue_size,
+            runtime=runtime,
             visited_tasks=visited_tasks,
             explorer_cache=explorer_cache,
             screen_cache=screen_cache,
-            popup_dismiss_max_attempts=args.popup_dismiss_max_attempts,
+            popup_dismiss_max_attempts=args.popup_dismiss_max_attempts if feature_flags.popup_auto_dismiss else 0,
         )
     finally:
         if enable_ui_semantic_collect and ui_collect_async and collect_queue is not None:
@@ -256,7 +285,26 @@ def main() -> None:
             for thread in collect_threads:
                 thread.join(timeout=2.0)
             collect_threads.clear()
-        logging.info("Auto-search finished. data_dir=%s", data_dir)
+
+        flush_artifact_tasks(timeout=60.0)
+        metrics.finish_run()
+        metrics_payload = build_metrics_payload(
+            metrics=metrics,
+            experiment_tag=args.experiment_tag,
+            data_dir=data_dir,
+            feature_flags=feature_flags,
+            configured_depth_limit=args.depth,
+            configured_breadth=args.breadth,
+        )
+        write_metrics_payload(metrics_output_path, metrics_payload)
+        logging.info("Auto-search finished. data_dir=%s metrics=%s", data_dir, metrics_output_path)
+
+    return metrics_payload
+
+
+def main() -> None:
+    args = parse_args()
+    run(args)
 
 
 if __name__ == "__main__":

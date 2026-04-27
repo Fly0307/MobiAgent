@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AUTO_EXPLORE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${AUTO_EXPLORE_ROOT}/.." && pwd)"
 
-APP_NAME="微博"
+APP_NAME="淘宝"
 DEPTH=2 # 探索页面的深度，3-4
 BREADTH=2 # 在每一个页面探索的广度，5-10，路径总数最多为BREADTH的DEPTH次方
 

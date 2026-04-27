@@ -1,16 +1,24 @@
 from unittest import TestCase
 from pathlib import Path
 
+from test_support import install_test_stubs
+
+install_test_stubs()
+
 
 class AutoExploreModuleBoundaryTests(TestCase):
     def test_core_modules_are_importable(self):
         from auto_explore.core import artifacts  # noqa: F401
         from auto_explore.core import decider  # noqa: F401
         from auto_explore.core import dfs  # noqa: F401
+        from auto_explore.eval import cli  # noqa: F401
+        from auto_explore.eval import judge  # noqa: F401
+        from auto_explore.eval import loader  # noqa: F401
         from auto_explore.core import explorer  # noqa: F401
         from auto_explore.core import fingerprints  # noqa: F401
         from auto_explore.core import navigation  # noqa: F401
         from auto_explore.core import prompting  # noqa: F401
+        from auto_explore.core import runtime  # noqa: F401
         from auto_explore.core import ui_collect  # noqa: F401
 
     def test_selected_core_modules_have_local_implementations(self):
@@ -23,6 +31,9 @@ class AutoExploreModuleBoundaryTests(TestCase):
             Path("auto_explore/src/auto_explore/core/navigation.py"),
             Path("auto_explore/src/auto_explore/core/decider.py"),
             Path("auto_explore/src/auto_explore/core/dfs.py"),
+            Path("auto_explore/src/auto_explore/eval/loader.py"),
+            Path("auto_explore/src/auto_explore/eval/judge.py"),
+            Path("auto_explore/src/auto_explore/eval/cli.py"),
         ]
         for path in module_files:
             content = path.read_text(encoding="utf-8")

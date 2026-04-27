@@ -53,7 +53,7 @@ _STABLE_CLASS_KEYWORDS = (
 
 
 def _stable_text_fingerprint(hierarchy_text: str) -> str:
-    """只对导航栏/标题/底部Tab等固定UI元素的文字计算指纹，忽略内容区动态文字。"""
+    """Fingerprint only stable nav/title text to avoid dynamic-content noise."""
     if not hierarchy_text:
         return ""
     stable_texts: List[str] = []
@@ -84,8 +84,8 @@ def _stable_text_fingerprint(hierarchy_text: str) -> str:
                         or any(kw in cls for kw in _STABLE_CLASS_KEYWORDS)
                     ):
                         stable_texts.append(text)
-                    for v in node.values():
-                        _walk_stable(v)
+                    for value in node.values():
+                        _walk_stable(value)
                 elif isinstance(node, list):
                     for item in node:
                         _walk_stable(item)
@@ -109,10 +109,10 @@ def _hamming_distance_hex(a: str, b: str) -> int:
     if not a or not b or len(a) != len(b):
         return 64
     try:
-        x = int(a, 16) ^ int(b, 16)
+        value = int(a, 16) ^ int(b, 16)
     except Exception:
         return 64
-    return x.bit_count()
+    return value.bit_count()
 
 
 def _compute_dhash_hex(image_path: str, hash_size: int = 8) -> str:
@@ -164,8 +164,8 @@ def _collect_struct_tokens_from_json(hierarchy_obj: Any) -> List[str]:
                 res_id = str(attrs.get("resource-id", attrs.get("id", attrs.get("key", ""))))
                 bounds = str(attrs.get("bounds", attrs.get("rect", "")))
                 tokens.append(f"{cls}|{res_id}|{bounds}")
-            for v in node.values():
-                _walk(v)
+            for value in node.values():
+                _walk(value)
         elif isinstance(node, list):
             for item in node:
                 _walk(item)
@@ -200,6 +200,16 @@ def _safe_future(fut: "concurrent.futures.Future", default: Any) -> Any:
         return default
 
 
+def _compute_fingerprints_serial(
+    hierarchy_text: str,
+    screenshot_path: Optional[str] = None,
+) -> tuple:
+    fp = _hierarchy_fingerprint(hierarchy_text)
+    struct_fp = _compute_hierarchy_struct_fingerprint(hierarchy_text)
+    dhash_hex = _compute_dhash_hex(screenshot_path) if screenshot_path else ""
+    return fp, struct_fp, dhash_hex
+
+
 def _compute_fingerprints_concurrent(
     hierarchy_text: str,
     screenshot_path: Optional[str] = None,
@@ -213,16 +223,35 @@ def _compute_fingerprints_concurrent(
     return fp, struct_fp, dhash_hex
 
 
+def compute_fingerprints(
+    hierarchy_text: str,
+    screenshot_path: Optional[str] = None,
+    *,
+    concurrent_mode: bool = True,
+) -> tuple:
+    if concurrent_mode:
+        return _compute_fingerprints_concurrent(hierarchy_text, screenshot_path=screenshot_path)
+    return _compute_fingerprints_serial(hierarchy_text, screenshot_path=screenshot_path)
+
+
+def _simple_verify(pre_hierarchy: str, post_hierarchy: str) -> bool:
+    return _hierarchy_fingerprint(pre_hierarchy) == _hierarchy_fingerprint(post_hierarchy)
+
+
 def _triple_verify(
     pre_hierarchy: str,
     pre_struct_fp: str,
     pre_dhash: str,
     post_hierarchy: str,
     post_screenshot_path: str,
+    *,
+    concurrent_mode: bool = True,
 ) -> bool:
     fp_ok = _stable_text_fingerprint(pre_hierarchy) == _stable_text_fingerprint(post_hierarchy)
-    _, post_struct_fp_val, post_dhash = _compute_fingerprints_concurrent(
-        post_hierarchy, screenshot_path=post_screenshot_path
+    _, post_struct_fp_val, post_dhash = compute_fingerprints(
+        post_hierarchy,
+        screenshot_path=post_screenshot_path,
+        concurrent_mode=concurrent_mode,
     )
     struct_ok = pre_struct_fp == post_struct_fp_val
     visual_ok = (_hamming_distance_hex(pre_dhash, post_dhash) <= 3) if pre_dhash and post_dhash else fp_ok
@@ -261,13 +290,13 @@ def _extract_bounds_from_json(obj: Any) -> List[List[int]]:
 
     def _walk(node: Any) -> None:
         if isinstance(node, dict):
-            for key, val in node.items():
+            for key, value in node.items():
                 if key == "bounds":
-                    bounds = _coerce_bounds(val)
+                    bounds = _coerce_bounds(value)
                     if bounds:
                         bounds_list.append(bounds)
                 else:
-                    _walk(val)
+                    _walk(value)
         elif isinstance(node, list):
             for item in node:
                 _walk(item)
@@ -295,8 +324,8 @@ def _detect_countdown(text: str) -> bool:
     if not text:
         return False
     patterns = [
-        r"\b\d+\s*(秒|s|sec|second)s?\b",
-        r"(剩余|倒计时|跳过)\s*\d+",
+        r"\b\d+\s*(s|sec|second)s?\b",
+        r"(remaining|countdown|skip)\s*\d+",
         r"\b\d{1,2}:\d{2}\b",
     ]
     return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
@@ -308,6 +337,7 @@ __all__ = [
     "_collect_struct_tokens_from_xml",
     "_compute_dhash_hex",
     "_compute_fingerprints_concurrent",
+    "_compute_fingerprints_serial",
     "_compute_hierarchy_struct_fingerprint",
     "_detect_countdown",
     "_extract_bounds_from_hierarchy_text",
@@ -317,6 +347,8 @@ __all__ = [
     "_normalize_hierarchy_text",
     "_now_ts",
     "_safe_future",
+    "_simple_verify",
     "_stable_text_fingerprint",
     "_triple_verify",
+    "compute_fingerprints",
 ]

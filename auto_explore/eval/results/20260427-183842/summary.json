@@ -1,0 +1,19 @@
+{
+  "input_path": "d:\\cdl\\MobiAgent\\auto_explore\\results\\single\\20260424_180926_淘宝",
+  "target_level": "auto",
+  "judge_model": "qwen3vl",
+  "judge_base_url": "https://models.sjtu.edu.cn/api/v1",
+  "evaluated_at": "2026-04-27T18:38:42",
+  "sample_count": 1,
+  "success_count": 0,
+  "error_count": 1,
+  "averages": {},
+  "samples": [
+    {
+      "sample_id": "step_0001",
+      "trace_dir": "d:\\cdl\\MobiAgent\\auto_explore\\results\\single\\20260424_180926_淘宝\\steps\\step_0001",
+      "status": "error",
+      "error": "Connection error."
+    }
+  ]
+}

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
 import subprocess
@@ -183,7 +184,9 @@ def start_auto_search_processes(
             auto_search_args=auto_search_args,
             output_root=output_root,
         )
-        log_file = log_path.open("w", encoding="utf-8")
+        log_file = log_path.open("wb")
+        log_file.write(codecs.BOM_UTF8)
+        log_file.flush()
         process = subprocess.Popen(
             cmd,
             stdout=log_file,
@@ -201,6 +204,9 @@ def _build_subprocess_env() -> dict[str, str]:
     src_root = repo_root / "auto_explore" / "src"
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = str(src_root) if not existing else f"{src_root}{os.pathsep}{existing}"
+    # Force child Python processes to emit UTF-8 so runner.log stays readable with Chinese content.
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     return env
 
 

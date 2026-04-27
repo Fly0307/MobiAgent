@@ -2,7 +2,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from openai import OpenAI
 from PIL import Image
@@ -19,6 +19,7 @@ from auto_explore.core.artifacts import (
     _run_annotation_safe,
     save_hierarchy,
     save_raw_screenshot,
+    submit_artifact_task,
 )
 from auto_explore.core.explorer import get_hierarchy_text
 from auto_explore.core.fingerprints import _bbox_iou, _extract_bounds_from_hierarchy_text
@@ -37,7 +38,86 @@ BBOX_REFINE_CENTER_DIST_RATIO = settings.BBOX_REFINE_CENTER_DIST_RATIO
 BBOX_REFINE_IOU_THRESHOLD = settings.BBOX_REFINE_IOU_THRESHOLD
 DEVICE_WAIT_TIME = settings.DEVICE_WAIT_TIME
 WaitActionSkip = settings.WaitActionSkip
-_ANNOTATION_EXECUTOR = settings._ANNOTATION_EXECUTOR
+
+_DECIDER_ALLOWED_ACTIONS = {"click", "click_input", "input", "swipe", "wait", "done"}
+
+
+def _raise_decider_schema_error(kind: str, detail: str) -> None:
+    message = f"Decider invalid {kind}: {detail}"
+    logging.error(message)
+    raise ValueError(message)
+
+
+def _coerce_int_strict(value: Any, field_name: str) -> int:
+    if isinstance(value, bool):
+        _raise_decider_schema_error(field_name, f"boolean is not allowed: {value}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and float(value).is_integer():
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if re.fullmatch(r"[-+]?\d+", stripped):
+            return int(stripped)
+    _raise_decider_schema_error(field_name, f"expected integer, got {value!r}")
+
+
+def _sanitize_int_sequence(
+    values: Any,
+    expected_len: int,
+    field_name: str,
+) -> List[int]:
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes, bytearray)):
+        _raise_decider_schema_error(field_name, f"expected length-{expected_len} list, got {type(values).__name__}")
+    if len(values) != expected_len:
+        _raise_decider_schema_error(field_name, f"expected length {expected_len}, got {len(values)}")
+    return [_coerce_int_strict(value, field_name) for value in values]
+
+
+def sanitize_decider_response(response: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(response, dict):
+        _raise_decider_schema_error("action schema", f"response must be dict, got {type(response).__name__}")
+
+    action = response.get("action")
+    if action not in _DECIDER_ALLOWED_ACTIONS:
+        _raise_decider_schema_error("action schema", f"unsupported action {action!r}")
+
+    parameters = response.get("parameters")
+    if not isinstance(parameters, dict):
+        _raise_decider_schema_error("action schema", "'parameters' must be a dict")
+
+    sanitized = dict(response)
+    sanitized_params = dict(parameters)
+
+    if action in {"click", "click_input"}:
+        sanitized_params["bbox"] = _sanitize_int_sequence(parameters.get("bbox"), 4, "bbox")
+
+    if action == "click_input":
+        text = parameters.get("text")
+        if not isinstance(text, str) or not text.strip():
+            _raise_decider_schema_error("action schema", "click_input requires non-empty 'text'")
+        sanitized_params["text"] = text
+
+    if action == "input":
+        text = parameters.get("text")
+        if not isinstance(text, str) or not text.strip():
+            _raise_decider_schema_error("action schema", "input requires non-empty 'text'")
+        sanitized_params["text"] = text
+
+    if action == "swipe":
+        has_start = "start_coords" in parameters
+        has_end = "end_coords" in parameters
+        if has_start or has_end:
+            if not (has_start and has_end):
+                _raise_decider_schema_error(
+                    "coords",
+                    "swipe requires both 'start_coords' and 'end_coords' when explicit coordinates are provided",
+                )
+            sanitized_params["start_coords"] = _sanitize_int_sequence(parameters.get("start_coords"), 2, "coords")
+            sanitized_params["end_coords"] = _sanitize_int_sequence(parameters.get("end_coords"), 2, "coords")
+
+    sanitized["parameters"] = sanitized_params
+    return sanitized
 
 
 def _convert_bbox_to_qwen3_relative(bbox: List[int], img_w: int, img_h: int) -> List[int]:
@@ -193,8 +273,23 @@ def execute_decider_one_step(
     allow_hierarchy_text_decider: bool,
     output_dir: str,
     step_index: int,
+    runtime,
+    history: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """使用 e2e decider 执行一个单步任务并记录数据。"""
+    """Execute one decider step and persist its step-local artifacts."""
+    metrics = runtime.metrics
+    trace: Dict[str, Any] = {
+        "phase": "decider",
+        "step_index": step_index,
+        "task": step_task,
+    }
+
+    t0 = metrics.now()
+    trace["T0"] = metrics.relative_time(t0)
+    screenshot_b64 = get_screenshot(device, device_type)
+    t1 = metrics.now()
+    trace["T1"] = metrics.relative_time(t1)
+
     pre_action_hierarchy_text = get_hierarchy_text(device)
     target_text = _extract_click_target_text(step_task)
     bounds_from_text = (
@@ -202,7 +297,7 @@ def execute_decider_one_step(
     )
 
     decider_resp: Optional[Dict[str, Any]] = None
-    if allow_hierarchy_text_decider and target_text and bounds_from_text:
+    if allow_hierarchy_text_decider and runtime.features.hierarchy_text_decider and target_text and bounds_from_text:
         green = "\033[92m"
         reset = "\033[0m"
         logging.info(f"{green}Using hierarchy_text_UI bbox for click target: {target_text}{reset}")
@@ -215,23 +310,31 @@ def execute_decider_one_step(
         decider_resp = {
             "action": "click",
             "parameters": {"bbox": best_bbox},
-            "reasoning": f"观察到屏幕上存在{target_text}文字，直接点击{target_text}文本按钮",
+            "reasoning": f"Hierarchy text matched the target: {target_text}",
         }
+        trace["T2"] = trace["T1"]
+        trace["T3"] = trace["T1"]
+        trace["T4"] = trace["T1"]
+        trace["t3_note"] = "hierarchy_shortcut"
     else:
         red = "\033[91m"
         reset = "\033[0m"
         logging.info(f"{red}Using model output bbox (decider).{reset}")
-        screenshot_b64 = get_screenshot(device, device_type)
         messages = build_auto_decider_messages(
             task=f"当前处在{app_name}，请帮我{step_task}",
-            history=[],
+            history=history or [],
             screenshot_b64=screenshot_b64,
         )
 
         def _validator(resp: Dict[str, Any]) -> None:
             validate_decider_response(resp, use_e2e=True)
+            sanitize_decider_response(resp)
 
         for attempt in range(3):
+            request_start = metrics.now()
+            trace["attempt"] = attempt + 1
+            trace["T2"] = metrics.relative_time(request_start)
+            call_start = time.perf_counter()
             decider_resp = call_model_with_validation_retry(
                 decider_client,
                 decider_model,
@@ -241,6 +344,22 @@ def execute_decider_one_step(
                 max_tokens=256,
                 context="Decider",
             )
+            call_end = time.perf_counter()
+            metrics.record_decider_call(call_end - call_start)
+            trace["T3"] = metrics.relative_time(call_end)
+            trace["T4"] = metrics.relative_time(call_end)
+            trace["t3_note"] = "non_streaming_response"
+            try:
+                decider_resp = sanitize_decider_response(decider_resp)
+            except ValueError:
+                if attempt < 2:
+                    logging.warning(
+                        "Decider returned invalid executable payload (attempt=%s), retrying.",
+                        attempt + 1,
+                    )
+                    time.sleep(0.6)
+                    continue
+                raise
             action = decider_resp.get("action")
             if action == "done":
                 if attempt < 2:
@@ -271,8 +390,15 @@ def execute_decider_one_step(
     if decider_resp is None:
         raise RuntimeError("Decider response is empty")
 
-    screenshot_file = save_raw_screenshot(output_dir, step_index, device_type)
-    save_hierarchy(device, device_type, output_dir, step_index)
+    screenshot_file = save_raw_screenshot(output_dir, step_index, device_type, metrics=metrics)
+    save_hierarchy(
+        device,
+        device_type,
+        output_dir,
+        step_index,
+        async_enabled=runtime.features.async_artifact_io,
+        metrics=metrics,
+    )
 
     react_item = {
         "action_index": step_index,
@@ -299,6 +425,8 @@ def execute_decider_one_step(
         "type": action,
     }
 
+    t5 = metrics.now()
+    trace["T5"] = metrics.relative_time(t5)
     if action == "click":
         bbox = params.get("bbox")
         if use_qwen3:
@@ -349,18 +477,37 @@ def execute_decider_one_step(
             }
         )
     elif action == "wait":
-        logging.info("Decider returned 'wait' — sleeping 2s and skipping step.")
+        logging.info("Decider returned 'wait' - sleeping 2s and skipping step.")
         time.sleep(2.0)
-        raise WaitActionSkip("wait action — step not recorded")
+        trace["T6"] = metrics.relative_time(metrics.now())
+        trace["action"] = action
+        metrics.record_timing_trace(trace)
+        raise WaitActionSkip("wait action - step not recorded")
     elif action == "done":
         action_record["status"] = params.get("status", "success")
     else:
         raise ValueError(f"Unsupported action from decider: {action}")
 
-    _ANNOTATION_EXECUTOR.submit(_run_annotation_safe, action, action_record, screenshot_file, output_dir, step_index)
+    t6 = metrics.now()
+    trace["T6"] = metrics.relative_time(t6)
+    trace["action"] = action
+
+    if runtime.features.async_artifact_io:
+        submit_artifact_task(
+            _run_annotation_safe,
+            action,
+            action_record,
+            screenshot_file,
+            output_dir,
+            step_index,
+            metrics,
+        )
+    else:
+        _run_annotation_safe(action, action_record, screenshot_file, output_dir, step_index, metrics)
 
     time.sleep(settings.DEVICE_WAIT_TIME)
     post_hierarchy_text = get_hierarchy_text(device)
+    metrics.record_timing_trace(trace)
 
     return {
         "decider_response": decider_resp,
@@ -383,4 +530,5 @@ __all__ = [
     "_extract_text_bounds_from_hierarchy_text",
     "execute_decider_one_step",
     "refine_bbox_with_hierarchy",
+    "sanitize_decider_response",
 ]

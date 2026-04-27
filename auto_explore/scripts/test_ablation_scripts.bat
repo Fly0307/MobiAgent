@@ -2,14 +2,15 @@
 chcp 65001 >nul
 setlocal enabledelayedexpansion
 
-rem Auto-search single-run template for Windows.
-rem For Chinese app names, prefer setting AUTO_EXPLORE_APP_NAME in the shell before running.
-rem Keep the default APP_NAME ASCII-only to avoid Windows batch encoding issues.
+rem Smoke-test every ablation experiment entry with the same defaults as run_single.bat.
+rem Set AUTO_EXPLORE_APP_NAME in the shell before running, or edit APP_NAME below.
 
 set "APP_NAME=DemoApp"
 set "DEPTH=1"
 set "BREADTH=1"
 set "DEVICE=Android"
+set "REPEATS=1"
+set "STOP_ON_ERROR=on"
 
 rem Decider configuration.
 set "DECIDER_BASE_URL=http://166.111.53.96:7003/v1"
@@ -30,7 +31,6 @@ set "OPENROUTER_API_KEY=%SJTU_API_KEY%"
 
 rem Runtime options.
 set "USE_QWEN3=on"
-set "DATA_DIR="
 set "ALLOW_HIERARCHY_TEXT_DECIDER=on"
 set "ENABLE_UI_SEMANTIC_COLLECT=on"
 
@@ -58,8 +58,7 @@ set "UI_COLLECT_MAX_VLM_CALLS=12"
 set "UI_COLLECT_MIN_AREA=16"
 
 if defined AUTO_EXPLORE_APP_NAME set "APP_NAME=%AUTO_EXPLORE_APP_NAME%"
-if defined AUTO_EXPLORE_DEPTH set "DEPTH=%AUTO_EXPLORE_DEPTH%"
-if defined AUTO_EXPLORE_BREADTH set "BREADTH=%AUTO_EXPLORE_BREADTH%"
+if defined AUTO_EXPLORE_ABLATION_REPEATS set "REPEATS=%AUTO_EXPLORE_ABLATION_REPEATS%"
 
 if "%APP_NAME%"=="" (
     echo Error: APP_NAME is empty.
@@ -73,7 +72,9 @@ set "SCRIPT_DIR=%~dp0"
 for %%I in ("%SCRIPT_DIR%..") do set "AUTO_EXPLORE_DIR=%%~fI"
 set "SRC_ROOT=%AUTO_EXPLORE_DIR%\src"
 for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "$ts = Get-Date -Format 'yyyyMMdd_HHmmss'; $name = $env:APP_NAME -replace '[\\/:*?""<>| ]', '_'; Write-Output ($ts + '_' + $name)"`) do set "RUN_DIR_SUFFIX=%%I"
-if "%DATA_DIR%"=="" set "DATA_DIR=%AUTO_EXPLORE_DIR%\results\single\%RUN_DIR_SUFFIX%"
+set "OUTPUT_ROOT=%AUTO_EXPLORE_DIR%\results\ablation_script_test\%RUN_DIR_SUFFIX%"
+
+if defined AUTO_EXPLORE_ABLATION_OUTPUT_ROOT set "OUTPUT_ROOT=%AUTO_EXPLORE_ABLATION_OUTPUT_ROOT%"
 
 if exist "C:\Users\28125\anaconda3\envs\MobiAgent\python.exe" (
     set "PYTHON_EXE=C:\Users\28125\anaconda3\envs\MobiAgent\python.exe"
@@ -87,10 +88,14 @@ if "%PYTHONPATH%"=="" (
     set "PYTHONPATH=%SRC_ROOT%;%PYTHONPATH%"
 )
 
-echo Running auto-search with app=%APP_NAME% depth=%DEPTH% breadth=%BREADTH% ...
-echo Data dir: %DATA_DIR%
+echo Smoke-testing ablation entries with app=%APP_NAME% depth=%DEPTH% breadth=%BREADTH% ...
+echo Output root: %OUTPUT_ROOT%
 
-set CMD="%PYTHON_EXE%" -m auto_explore.cli.auto_search ^
+set CMD="%PYTHON_EXE%" "%SCRIPT_DIR%test_ablation_scripts.py" ^
+ --output-root "%OUTPUT_ROOT%" ^
+ --repeats "%REPEATS%" ^
+ --stop-on-error "%STOP_ON_ERROR%" ^
+ -- ^
  --app_name "%APP_NAME%" ^
  --depth "%DEPTH%" ^
  --breadth "%BREADTH%" ^
@@ -121,8 +126,6 @@ set CMD="%PYTHON_EXE%" -m auto_explore.cli.auto_search ^
  --bbox_area_ratio_min "%BBOX_AREA_RATIO_MIN%" ^
  --bbox_area_ratio_max "%BBOX_AREA_RATIO_MAX%" ^
  --popup_dismiss_max_attempts "%POPUP_DISMISS_MAX_ATTEMPTS%"
-
-if not "%DATA_DIR%"=="" set CMD=%CMD% --data_dir "%DATA_DIR%"
 
 pushd "%SRC_ROOT%"
 %CMD%

@@ -297,3 +297,105 @@ Trajectory Reward Model 对数据进行评分 增加对于语义连贯性的打�
 
 
 
+### 4.20
+结果总结：
+
+
+E0 full
+Run params:
+- app=`淘宝`
+- device=`Harmony`
+- depth=`3`
+- breadth=`3`
+- adaptive_search=`off`
+- flags=`(none)`
+
+Derived summary:
+- precision=`100.0%`
+- recall=`33.3%`
+- false_positive_rate=`0.0%`
+- replay_recovery_success_rate=`28.6%`
+- dedup_ratio=`11.1%`
+- adaptive_search_enabled=`false`
+- effective_breadth_avg=`3.0`
+
+Timing:
+- step_avg=`247.66s` 
+- hierarchy_fetch_avg=`1.09s`
+- explorer_api_avg=`42.58s` 
+- capture_screen_avg=`1.84s`
+- prepare_page_avg=`44.49s`
+- explorer_phase_avg=`29.32s`
+- decider_step_avg=`32.54s`
+- backtrack_action_avg=`1.75s`
+- backtrack_verify_avg=`5.18s`
+- replay_recovery_avg=`55.92s`
+
+Observations:
+- E0 当前最明显的问题不是误判成功，而是恢复成本高；`FP=0`，但 `FN=2`，说明系统偏保守。
+- 最主要耗时集中在 `prepare_page`、`explorer_api`、`decider_step` 和 `replay_recovery`。
+- 当前 `replay_recovery` 成功率偏低，是整条链路的主要稳定性瓶颈。
+
+
+
+4.27
+加了模型评测轨迹
+
+回溯耗时问题
+
+Result summary for `auto_explore/results/ablation/20260426_004631_淘宝/E0_full/run_001/metrics.json`
+
+Run params:
+- app=`淘宝`
+- experiment=`E0_full`
+- depth=`20`
+- breadth=`20`
+- feature_flags=`all enabled`
+
+Derived summary:
+- wall_time=`111500.60s` (`~30.97h`)整个 run 的总墙钟时间，从启动到结束的真实耗时。
+- step_count=`810`被记录的 step 数量，用于反映整次搜索执行了多少步动作。
+- saved_traces=`483` (`328` complete, `155` partial, complete_ratio=`67.9%`)
+- explorer_calls=`544` (total=`75631.64s`, avg=`139.03s`)
+- decider_calls=`838` (total=`1269.44s`, avg=`1.51s`)
+- backtrack_count=`791` (avg=`27.66s`)
+- artifact_io_total=`209.20s`
+- cache_hit_rate=`0.0%` (`explorer_cache=0.0%`, `screen_cache=0.0%`)
+
+Recovery / stability:
+- verify_success_rate=`60.30%`
+- replay_recovery_sequences=`314`
+- replay_recovery_attempts=`615`
+- replay_recovery_success_rate=`4.14%`
+- final_backtrack_success_rate=`61.95%`
+
+Metric meanings:
+- `wall_time`: 整个 run 的总墙钟时间，从启动到结束的真实耗时。
+- `step_count`: 被记录的 step 数量，用于反映整次搜索执行了多少步动作。
+- `saved_traces`: 最终落盘保存的轨迹总数，等于 `complete_path_count + partial_path_count`。
+- `complete`: 成功保存为完整 path 的轨迹数。
+- `partial`: 中途终止或未完整收束、但仍被保存下来的 partial path 数。
+- `complete_ratio`: 完整轨迹占全部保存轨迹的比例，这里是 `complete / saved_traces`。
+- `explorer_calls`: Explorer 模型被调用的次数。
+- `explorer_calls total`: Explorer 调用累计耗时总和。
+- `explorer_calls avg`: 平均每次 Explorer 调用耗时，计算口径是 `explorer_time_sec_total / explorer_call_count`。
+- `decider_calls`: Decider 模型被调用的次数。
+- `decider_calls total`: Decider 调用累计耗时总和。
+- `decider_calls avg`: 平均每次 Decider 调用耗时，计算口径是 `decider_time_sec_total / decider_call_count`。
+- `backtrack_count`: 发生回溯校验的次数；通常每次 DFS 分支收束或切换兄弟分支时会触发。
+- `backtrack_count avg`: 平均每次回溯耗时，对应 `avg_backtrack_time_sec`。
+- `artifact_io_total`: 截图、轨迹、日志等工件写盘累计耗时。
+- `cache_hit_rate`: Explorer cache 的总体命中率，口径与 `explorer_cache_hit_rate` 相同。
+- `explorer_cache`: Explorer 响应缓存命中率，计算方式是 `explorer_cache_hits / explorer_cache_requests`。
+- `screen_cache`: 页面状态缓存命中率，计算方式是 `screen_cache_hits / screen_cache_requests`。
+- `verify_success_rate`: 不依赖 recovery，仅通过常规回溯校验就能成功回到目标状态的比例，计算方式是 `backtrack_verify_successes / backtrack_count`。
+- `replay_recovery_sequences`: 至少触发过一次 recovery 的回溯序列数。
+- `replay_recovery_attempts`: 所有 recovery 序列中的恢复尝试总次数。
+- `replay_recovery_success_rate`: 触发 recovery 的那些序列里，最终恢复成功的比例，计算方式是 `recovery_success_count / replay_recovery_sequence_count`。
+- `final_backtrack_success_rate`: 最终回溯成功率，既包含直接 verify 成功，也包含 verify 失败后通过 recovery 补救成功，计算方式是 `(verify_successes + recovery_successes) / backtrack_count`。
+
+Observations:
+- 这是一次高覆盖但高成本的 full baseline；在 `depth=20`、`breadth=20` 下产出了大量完整路径，但总耗时接近 `31h`。
+- 主要瓶颈明确在 `Explorer`，而不在 `Decider`；Explorer 总耗时约 `21.0h`，Decider 总耗时仅约 `21.2min`。
+- `replay_recovery` 的边际收益很小：`final_backtrack_success_rate` 相比 `verify_success_rate` 只提升了约 `1.64` 个百分点，但引入了 `615` 次恢复尝试。
+- 三类 cache 命中率全部为 `0`，说明当前缓存策略没有形成实际收益，后续应优先检查缓存 key 设计或页面复用判定是否过严。
